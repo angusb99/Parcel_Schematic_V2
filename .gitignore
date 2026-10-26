@@ -1,0 +1,14 @@
+# earlier I/O version, kept locally only
+archive/
+
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# local tooling
+.claude/
+.vscode/
+.idea/
