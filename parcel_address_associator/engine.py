@@ -9,7 +9,7 @@ import pandas as pd
 
 from . import codes
 from .config import Config
-from .model import INPUT_COLUMNS, REQUIRED_COLUMNS, Address
+from .model import INPUT_COLUMNS, OPTIONAL_COLUMNS, REQUIRED_COLUMNS, Address
 from .reconcile import ParcelResult, analyse_parcel
 
 _IDENT = re.compile(r"^([A-Z]*)(\d+)([A-Z]*)$")
@@ -75,6 +75,13 @@ def prepare_input(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
         else:
             out[c] = ""
             issue("missing_column", "warning", len(df), "%s not supplied; treated as blank" % c)
+    for c in OPTIONAL_COLUMNS:
+        if c in lookup:
+            out[c] = clean_text(df[lookup[c]])
+        else:
+            out[c] = ""
+            issue("optional_column_absent", "info", len(df), "%s not supplied; use reconciliation "
+                  "will rely on the second dataset alone" % c)
     n_in = len(out)
 
     blank = out["ADDR_ID"] == ""

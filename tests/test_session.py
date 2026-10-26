@@ -77,10 +77,26 @@ class EndToEnd(unittest.TestCase):
         dup = a[a["DUPLICATE_OF"] != ""]
         self.assertTrue(dup["DUPLICATE_OF"].isin(set(g["PREFERRED_ADDR_ID"])).all())
 
+    def test_save_html(self):
+        import os
+        import tempfile
+        d = tempfile.mkdtemp(prefix="paa_html_")
+        pid = self.s.interesting_parcels(1)[0]
+        path = self.s.save_html(os.path.join(d, "nested", "one.html"), parcels=[pid])
+        self.assertTrue(os.path.isfile(path))
+        doc = open(path, encoding="utf-8").read()
+        self.assertTrue(doc.startswith("<!doctype html>"))
+        self.assertEqual(doc.count("<section"), 1)
+        self.assertIn("<svg", doc)
+        self.assertNotIn("<script", doc)
+        full = open(self.s.save_html(os.path.join(d, "all.html"), max_parcels=5), encoding="utf-8").read()
+        self.assertEqual(full.count("<section"), 5)
+
     def test_views(self):
         pid = self.s.interesting_parcels(1)[0]
         self.assertIn("<svg", self.s.show_parcel(pid))
         self.assertIn("STYLES", self.s.schematic(pid))
+        self.assertEqual(list(self.s.overview().columns), ["METRIC", "VALUE"])
         aid = self.s.addresses().query("GROUP_ID != ''").ADDR_ID.iloc[0]
         self.assertIn("GROUP", self.s.explain(aid))
 

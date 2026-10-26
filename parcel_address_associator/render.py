@@ -97,10 +97,109 @@ def stacking_svg(r: ParcelResult, st, slots: Dict[str, int], max_units: int = 40
     return "".join(out)
 
 
-def parcel_html(r: ParcelResult, cfg: Config, max_rows: int = 200) -> str:
+USE_FILL = {"RESIDENTIAL": "var(--s1)", "NOT_RESIDENTIAL": "var(--muted)", "UNCERTAIN": "#fab219"}
+
+
+def use_plan_svg(r: ParcelResult, st, use_rows: Dict[str, dict], max_units: int = 40) -> str:
+    """Stacking plan coloured by reconciled use; a red outline marks slots where a
+    change to either source is suggested."""
+    grid = r.cells.get(st.id, {})
+    if not grid:
+        return '<p class="muted">No level information to draw a use plan.</p>'
+    levels = sorted({k[0] for k in grid}, reverse=True)
+    units = sorted({k[1] for k in grid}, key=_n)[:max_units]
+    cw, ch, gap, lm, tm = 24, 18, 2, 34, 18
+    w = lm + len(units) * (cw + gap) + 4
+    h = tm + len(levels) * (ch + gap) + 4
+    out = ['<svg role="img" aria-label="use plan %s" width="%d" height="%d" viewBox="0 0 %d %d">'
+           % (_e(st.id), w, h, w, h)]
+    for j, u in enumerate(units):
+        out.append('<text x="%d" y="12" text-anchor="middle">%s</text>' % (lm + j * (cw + gap) + cw // 2, _e(u)))
+    for i, lv in enumerate(levels):
+        y = tm + i * (ch + gap)
+        out.append('<text x="%d" y="%d" text-anchor="end">%s</text>' % (lm - 6, y + 13, _e(_lvl(lv))))
+        for j, u in enumerate(units):
+            x = lm + j * (cw + gap)
+            fs = grid.get((lv, u))
+            rows = [use_rows[f.pid] for f in fs or [] if f.pid in use_rows]
+            if not rows:
+                out.append('<rect x="%d" y="%d" width="%d" height="%d" rx="3" fill="var(--empty)"/>' % (x, y, cw, ch))
+                continue
+            use = rows[0]["RECONCILED_USE"]
+            # outline use corrections only; de-counting duplicates is listed, not drawn
+            change = any((rw["CHANGE_BASE"] or rw["CHANGE_OTHER"])
+                         and rw["CATEGORY"] != "DUPLICATE_OF_COUNTED_DWELLING" for rw in rows)
+            review = any(rw["CATEGORY"] in ("UNRESOLVED", "POSSIBLE_DUPLICATE") for rw in rows)
+            stroke = ' stroke="var(--s8)" stroke-width="2"' if change else (
+                ' stroke="#fab219" stroke-width="2" stroke-dasharray="3 2"' if review else "")
+            tip = "%s %s unit %s: %s (P=%.2f)\n%s" % (st.id, _lvl(lv), u, use, rows[0]["P_DWELLING"], "\n".join(
+                "%s  base=%s other=%s  %s %s" % (rw["LABEL"], _yn(rw["BASE_RESIDENTIAL"]),
+                                                  _yn(rw["OTHER_RESIDENTIAL"]), rw["CATEGORY"],
+                                                  rw["SUGGESTED_ACTION"]) for rw in rows))
+            out.append('<g><rect x="%d" y="%d" width="%d" height="%d" rx="3" fill="%s"%s/><title>%s</title></g>'
+                       % (x + 1, y + 1, cw - 2, ch - 2, USE_FILL.get(use, "var(--empty)"), stroke, _e(tip)))
+    out.append("</svg>")
+    return "".join(out)
+
+
+def _yn(v) -> str:
+    return "?" if v is None or (isinstance(v, float) and v != v) else ("Y" if v else "N")
+
+
+def use_section_html(r: ParcelResult, use_rows: Dict[str, dict], blocks_df, max_rows: int = 200) -> str:
+    rows = [use_rows[f.pid] for f in r.feats if f.pid in use_rows]
+    if not rows:
+        return ""
+    base_n = sum(1 for x in rows if x["BASE_RESIDENTIAL"] == True)    # noqa: E712 (None-safe)
+    other_n = sum(1 for x in rows if x["OTHER_RESIDENTIAL"] == True)  # noqa: E712
+    rec_n = sum(1 for x in rows if x["COUNTED_DWELLING_ADDR_ID"] == x["ADDR_ID"])
+    h = ["<h4>7. Residential use</h4><div class='tiles'>"]
+    for v, t in ((base_n, "base residential"), (other_n, "other residential"), (rec_n, "reconciled dwellings"),
+                 (sum(1 for x in rows if x["CHANGE_BASE"]), "base changes suggested"),
+                 (sum(1 for x in rows if x["CHANGE_OTHER"]), "other changes suggested"),
+                 (sum(1 for x in rows if x["CATEGORY"] in ("UNRESOLVED", "POSSIBLE_DUPLICATE")), "to review")):
+        h.append("<div class='tile'><b>%s</b><span>%s</span></div>" % (format(v, ","), _e(t)))
+    h.append("</div>")
+    if blocks_df is not None and len(blocks_df):
+        h.append("<table><tr><th>Block</th><th>Style</th><th>Premises</th><th>Both</th><th>Base only</th>"
+                 "<th>Other only</th><th>Neither</th><th>Verdict</th></tr>")
+        for b in blocks_df.itertuples(index=False):
+            h.append("<tr><td class='mono'>%s</td><td class='mono'>%s</td><td class='n'>%d</td><td class='n'>%d</td>"
+                     "<td class='n'>%d</td><td class='n'>%d</td><td class='n'>%d</td><td>%s</td></tr>"
+                     % (_e(b.BLOCK_ID), _e(b.STYLE_TEMPLATE), b.N_PREMISES, b.BOTH_RESIDENTIAL, b.BASE_ONLY,
+                        b.OTHER_ONLY, b.NEITHER, _e(b.VERDICT)))
+        h.append("</table>")
+    if r.structures:
+        h.append("<div class='sub' style='margin-top:6px'><span class='sw' style='background:var(--s1)'></span>"
+                 "residential <span class='sw' style='background:var(--muted)'></span>not residential "
+                 "<span class='sw' style='background:#fab219'></span>uncertain · red outline = use correction "
+                 "suggested · dashed = review · duplicate de-counting is in the table below · hover for flags"
+                 "</div><div class='plans'>")
+        for st in r.structures:
+            h.append("<div><div><b>%s</b> %s</div>%s</div>" % (_e(st.id), _e(st.label), use_plan_svg(r, st, use_rows)))
+        h.append("</div>")
+    issues = [x for x in rows if x["CATEGORY"] != "OK"]
+    if issues:
+        h.append("<table><tr><th>Address</th><th>Base</th><th>Other</th><th>Reconciled</th><th>Category</th>"
+                 "<th>Suggested</th></tr>")
+        order = {"BUILDING_OR_SITE_ADDRESS": 0, "MISSED_BY_OTHER": 1, "MISSED_BY_BASE": 2,
+                 "LIKELY_NOT_RESIDENTIAL": 3, "MISSED_BY_BOTH": 4, "UNRESOLVED": 5, "POSSIBLE_DUPLICATE": 6,
+                 "DUPLICATE_OF_COUNTED_DWELLING": 7}
+        for x in sorted(issues, key=lambda x: (order.get(x["CATEGORY"], 9), x["LABEL"]))[:max_rows]:
+            h.append("<tr><td>%s <span class='muted mono'>%s</span></td><td>%s</td><td>%s</td><td>%s %.2f</td>"
+                     "<td>%s</td><td class='ev'>%s</td></tr>"
+                     % (_e(x["LABEL"]), _e(x["ADDR_ID"]), _yn(x["BASE_RESIDENTIAL"]), _yn(x["OTHER_RESIDENTIAL"]),
+                        _e(x["RECONCILED_USE"]), x["P_DWELLING"], _e(x["CATEGORY"]), _e(x["SUGGESTED_ACTION"])))
+        h.append("</table>")
+    return "".join(h)
+
+
+def parcel_html(r: ParcelResult, cfg: Config, max_rows: int = 200, include_css: bool = True,
+                use_rows: Optional[Dict[str, dict]] = None, use_blocks=None) -> str:
     slots = style_slots(r)
     n_rev = len(r.review_pairs)
-    h = [CSS, '<div class="paa"><h3>Parcel <span class="mono">%s</span></h3>' % _e(r.parcel)]
+    h = [CSS if include_css else "",
+         '<div class="paa"><h3>Parcel <span class="mono">%s</span></h3>' % _e(r.parcel)]
     h.append('<div class="sub">%d addresses: %d sub-addresses in %d styles and %d blocks, %d parents. '
              '<b>%d duplicate groups</b>, %d review candidates.</div>'
              % (len(r.feats), r.n_sub, len(r.styles), len(r.blocks), len(r.parents), len(r.groups), n_rev))
@@ -169,6 +268,8 @@ def parcel_html(r: ParcelResult, cfg: Config, max_rows: int = 200) -> str:
             h.append("<tr><td>%s</td><td>%s</td><td>%s</td><td class='ev'>%s</td></tr>"
                      % (_e(p.a.label), _e(p.b.label), _e(p.relation), _e(why)))
         h.append("</table>")
+    if use_rows:
+        h.append(use_section_html(r, use_rows, use_blocks, max_rows))
     h.append("</div>")
     return "".join(h)
 
@@ -224,4 +325,51 @@ def overview_html(results: Iterable[ParcelResult], stats: Dict[str, object]) -> 
     h = [CSS, "<div class='paa'><div class='tiles'>"]
     h += ["<div class='tile'><b>%s</b><span>%s</span></div>" % (format(v, ","), _e(t)) for v, t in tiles]
     h.append("</div></div>")
+    return "".join(h)
+
+
+PAGE_CSS = """<style>
+body{margin:0;background:#fcfcfb}@media (prefers-color-scheme:dark){body{background:#1a1a19}}
+.paa.page{max-width:1400px;margin:0 auto;padding:24px 16px 64px;background:var(--surface)}
+.paa h1{font-size:22px;margin:0 0 4px}.paa section{border-top:1px solid var(--grid);margin-top:28px;padding-top:6px}
+.paa a{color:var(--s1);text-decoration:none}.paa table{display:block;overflow-x:auto;max-width:100%}
+</style>"""
+
+
+def report_html(results: Iterable[ParcelResult], cfg: Config, stats: Dict[str, object],
+                detailed: List[str], title: str = "Parcel Address Associator", index_rows: int = 1000,
+                use: Optional[Dict[str, object]] = None) -> str:
+    """Standalone HTML document: overview, parcel index, and a full section for each
+    parcel in ``detailed``. Self-contained (inline CSS and SVG, no scripts)."""
+    import datetime
+
+    res = sorted(results, key=lambda r: (-len(r.groups), -len(r.feats), r.parcel))
+    by_id = {r.parcel: r for r in res}
+    detailed = [p for p in detailed if p in by_id]
+    shown = set(detailed)
+    h = ['<!doctype html><html lang="en"><head><meta charset="utf-8">'
+         '<meta name="viewport" content="width=device-width,initial-scale=1">'
+         '<title>%s</title>%s%s</head><body><div class="paa page">' % (_e(title), CSS, PAGE_CSS)]
+    h.append("<h1>%s</h1><div class='sub'>Generated %s · %d parcels analysed · %d shown in detail below</div>"
+             % (_e(title), datetime.datetime.now().strftime("%Y-%m-%d %H:%M"), len(res), len(detailed)))
+    h.append(overview_html(res, stats).replace(CSS, ""))
+    h.append("<h4>Parcels (%s)</h4><table><tr><th>Parcel</th><th>Addresses</th><th>Styles</th><th>Structures</th>"
+             "<th>Duplicate groups</th><th>Redundant addresses</th><th>Review pairs</th></tr>"
+             % ("first %d of %d" % (index_rows, len(res)) if len(res) > index_rows else len(res)))
+    for r in res[:index_rows]:
+        name = ("<a href='#p-%s'>%s</a>" % (_e(r.parcel), _e(r.parcel))) if r.parcel in shown else _e(r.parcel)
+        h.append("<tr><td class='mono'>%s</td><td class='n'>%d</td><td class='n'>%d</td><td class='n'>%d</td>"
+                 "<td class='n'>%d</td><td class='n'>%d</td><td class='n'>%d</td></tr>"
+                 % (name, len(r.feats), len(r.styles), len(r.structures), len(r.groups),
+                    sum(len(g.members) - 1 for g in r.groups), len(r.review_pairs)))
+    h.append("</table>")
+    use_rows, use_blocks = {}, None
+    if use:
+        use_rows = {row["ADDR_ID"]: row for row in use["addresses"].to_dict("records")}
+        use_blocks = use["blocks"]
+    for pid in detailed:
+        ub = use_blocks[use_blocks.CADASTRE_POLYGON_PID == pid] if use_blocks is not None and len(use_blocks) else None
+        h.append("<section id='p-%s'>%s</section>" % (_e(pid), parcel_html(
+            by_id[pid], cfg, include_css=False, use_rows=use_rows or None, use_blocks=ub)))
+    h.append("</div></body></html>")
     return "".join(h)

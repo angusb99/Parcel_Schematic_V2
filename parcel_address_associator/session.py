@@ -6,7 +6,7 @@
     s.profile()                      # 2. what each parcel holds
     s.run()                          # 3. analyse every parcel
     s.overview()                     # 4. headline numbers
-    s.show_parcel(pid)               # 5. one parcel end to end (styles, mappings, stacking plans)
+    s.save_html("report.html")       # 5. HTML report: styles, mappings, stacking plans per parcel
     s.duplicate_groups()             # 6. results as DataFrames
     s.explain(addr_id)               # 7. why one address was (or was not) grouped
 """
@@ -23,7 +23,7 @@ from .config import Config
 from .engine import analyse, prepare_input
 from .evaluate import evaluate as _evaluate
 from .reconcile import ParcelResult
-from .render import overview_html, parcel_html
+from .render import parcel_html
 
 
 def _display_html(html: str):
@@ -49,6 +49,9 @@ class AssociatorSession:
         self.results: Dict[str, ParcelResult] = {}
         self._log: List[Dict[str, object]] = []
         self._cache: Dict[str, pd.DataFrame] = {}
+        self.use_flags: Optional[Dict[str, Optional[bool]]] = None   # second dataset, by ADDR_ID
+        self.use_issues: Optional[pd.DataFrame] = None
+        self.use: Dict[str, pd.DataFrame] = {}                       # reconciliation outputs
 
     def __repr__(self) -> str:
         if not self.results:
@@ -160,6 +163,9 @@ class AssociatorSession:
         else:
             self.results.update(new)
         self._cache.clear()
+        if self.use:
+            self.use = {}
+            self._say("  (use reconciliation cleared: run reconcile_use() again)")
         groups = sum(len(r.groups) for r in new.values())
         self._record("run" if parcels is None else "rerun", t0, PARCELS=len(new), GROUPS=groups,
                      REVIEW_PAIRS=sum(len(r.review_pairs) for r in new.values()))
@@ -168,12 +174,61 @@ class AssociatorSession:
         return self
 
     # ------------------------------------------------------- 4. overview
-    def overview(self):
-        """Headline numbers (HTML in a notebook) and the parcel summary table."""
+    def overview(self) -> pd.DataFrame:
+        """Headline numbers as a small table."""
         self._need_results()
+        res = list(self.results.values())
+        rows = [
+            ("input rows", len(self.raw)),
+            ("rows accepted", len(self.clean)),
+            ("parcels analysed", len(res)),
+            ("addresses analysed", sum(len(r.feats) for r in res)),
+            ("duplicate groups", sum(len(r.groups) for r in res)),
+            ("addresses in duplicate groups", sum(len(g.members) for r in res for g in r.groups)),
+            ("redundant addresses (group size - 1)", sum(len(g.members) - 1 for r in res for g in r.groups)),
+            ("review candidate pairs", sum(len(r.review_pairs) for r in res)),
+        ]
+        return pd.DataFrame(rows, columns=["METRIC", "VALUE"])
+
+    # ----------------------------------------------------- HTML reports
+    def save_html(self, path: str = "parcel_address_report.html", parcels: Optional[Iterable[str]] = None,
+                  max_parcels: int = 50, title: str = "Parcel Address Associator") -> str:
+        """Write a standalone HTML report and return its absolute path. Nothing is
+        opened or displayed.
+
+        The report has the headline numbers, an index of every analysed parcel, and
+        a full section (styles, mappings, stacking plans, parents, groups, review
+        candidates) for each parcel in ``parcels``, or by default for the
+        ``max_parcels`` parcels with the most duplicate groups.
+        """
+        import os
+
+        from .render import report_html
+        self._need_results()
+        t0 = time.time()
+        if parcels is None:
+            detailed = self.interesting_parcels(max_parcels)
+        else:
+            detailed = [p for p in parcels]
+            missing = [p for p in detailed if p not in self.results]
+            if missing:
+                raise KeyError("Not analysed: %s" % ", ".join(missing[:5]))
         stats = {"rows_in": len(self.raw), "rows_accepted": len(self.clean)}
-        out = _display_html(overview_html(self.results.values(), stats))
-        return out if out is not None else self.parcel_summary()
+        html_doc = report_html(self.results.values(), self.config, stats, detailed, title=title,
+                               use=self.use or None)
+        path = os.path.abspath(path)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(html_doc)
+        self._record("save_html", t0, file=os.path.basename(path), parcels_detailed=len(detailed),
+                     kb=round(len(html_doc.encode("utf-8")) / 1024))
+        try:
+            shown = os.path.relpath(path)
+        except ValueError:                    # other drive on Windows
+            shown = path
+        self._say("saved %s (%d parcels in detail, %.0f KB)"
+                  % (shown, len(detailed), len(html_doc.encode("utf-8")) / 1024))
+        return path
 
     def interesting_parcels(self, n: int = 5) -> List[str]:
         """Parcels with the most duplicate groups, then the most styles."""
@@ -183,8 +238,16 @@ class AssociatorSession:
 
     # ------------------------------------------------------ 5. one parcel
     def show_parcel(self, parcel: str):
-        """Styles, how they map, stacking plans, parents, groups and review candidates."""
-        return _display_html(parcel_html(self._results(parcel)[0], self.config))
+        """Optional inline view of one parcel (rendered in the notebook cell; returns the
+        HTML string outside a notebook). Use ``save_html`` to write files instead."""
+        use_rows, use_blocks = None, None
+        if self.use:
+            t = self.use["addresses"]
+            use_rows = {row["ADDR_ID"]: row for row in t[t.CADASTRE_POLYGON_PID == parcel].to_dict("records")}
+            ub = self.use["blocks"]
+            use_blocks = ub[ub.CADASTRE_POLYGON_PID == parcel] if len(ub) else None
+        return _display_html(parcel_html(self._results(parcel)[0], self.config, use_rows=use_rows,
+                                         use_blocks=use_blocks))
 
     # ---------------------------------------------------------- 6. tables
     def parcel_summary(self) -> pd.DataFrame:
@@ -225,13 +288,118 @@ class AssociatorSession:
 
     def to_frames(self) -> Dict[str, pd.DataFrame]:
         """All outputs as DataFrames, ready to write wherever you like."""
-        return {
+        frames = {
             "issues": self.issues, "parcel_summary": self.parcel_summary(), "styles": self.styles(),
             "blocks": self.blocks(), "mappings": self.mappings(include_rejected=True),
             "structures": self.structures(), "addresses": self.addresses(),
             "duplicate_pairs": self.duplicate_pairs(), "duplicate_groups": self.duplicate_groups(),
             "review_candidates": self.review_candidates(),
         }
+        if self.use:
+            frames.update({"use_issues": self.use_issues, "use_reconciliation": self.use["addresses"],
+                           "use_areas": self.use["blocks"], "use_by_parcel": self.use["parcels"],
+                           "source_reliability": self.use["reliability"]})
+        return frames
+
+    # --------------------------------------------- 8. residential use
+    def attach_use(self, use_df: pd.DataFrame, id_col: str = "ADDR_ID",
+                   flag_col: str = "RESIDENTIAL_DWELLING") -> pd.DataFrame:
+        """Attach the second use dataset (one row per ADDR_ID with a yes/no flag).
+        Returns its validation issues."""
+        from .usage import prepare_use
+        self._need_clean()
+        t0 = time.time()
+        self.use_flags, self.use_issues = prepare_use(use_df, id_col, flag_col,
+                                                      known_ids=set(self.clean["ADDR_ID"]))
+        self.use = {}
+        self._record("attach_use", t0, rows=len(use_df), flags=len(self.use_flags),
+                     residential=sum(1 for v in self.use_flags.values() if v))
+        self._say("attach_use: %d flags (%d residential), %d issue types"
+                  % (len(self.use_flags), sum(1 for v in self.use_flags.values() if v), len(self.use_issues)))
+        return self.use_issues
+
+    def reconcile_use(self) -> "AssociatorSession":
+        """Reconcile the base ADDRESS_TYPE with the attached dataset, per premise,
+        using the parcel structure. Covers every accepted ADDR_ID (parcels too small
+        to analyse are reconciled from flat type and flags alone)."""
+        from .model import Address
+        from .usage import (block_use_table, build_premises, decide, find_area_patterns, fit,
+                            parcel_use_summary, review_partners)
+        self._need_results()
+        if self.use_flags is None:
+            raise RuntimeError("Attach the second dataset first: session.attach_use(use_df)")
+        t0 = time.time()
+        cfg = self.config
+        base_type = dict(zip(self.clean["ADDR_ID"], self.clean["ADDRESS_TYPE"]))
+        has_type = any(base_type.values())
+        base = {k: ((v in cfg.residential_address_types) if has_type else None) for k, v in base_type.items()}
+        analysed = {f.pid for r in self.results.values() for f in r.feats}
+        extra = [Address.from_row(r) for r in
+                 self.clean[~self.clean["ADDR_ID"].isin(analysed)].to_dict("records")]
+        premises, blocks = build_premises(self.results.values(), extra, base, self.use_flags,
+                                          review_partners(self.results.values()))
+        find_area_patterns(premises, blocks, cfg)
+        reliability = fit(premises, cfg)
+        table = decide(premises, base_type, base, self.use_flags, cfg)
+        self.use = {"addresses": table, "blocks": block_use_table(premises, blocks),
+                    "parcels": parcel_use_summary(table), "reliability": reliability}
+        cats = table["CATEGORY"].value_counts().to_dict()
+        self._record("reconcile_use", t0, addresses=len(table), premises=len(premises),
+                     **{c.lower(): n for c, n in cats.items() if c != "OK"})
+        self._say("reconcile_use: %d addresses in %d premises; %d base-only, %d other-only; "
+                  "%d suggested changes to base, %d to other"
+                  % (len(table), len(premises), int((table.DIRECTION == "BASE_ONLY").sum()),
+                     int((table.DIRECTION == "OTHER_ONLY").sum()), int(table.CHANGE_BASE.sum()),
+                     int(table.CHANGE_OTHER.sum())))
+        return self
+
+    def _need_use(self):
+        if not self.use:
+            raise RuntimeError("Run session.reconcile_use() first")
+
+    def use_reconciliation(self, parcel: Optional[str] = None, direction: Optional[str] = None,
+                           category: Optional[str] = None, changes_only: bool = False) -> pd.DataFrame:
+        """Per ADDR_ID: both flags, reconciled use, category, suggested flags, evidence.
+
+        direction: 'BASE_ONLY' (base residential, other not), 'OTHER_ONLY', 'BOTH', 'NEITHER'.
+        """
+        self._need_use()
+        df = self._filter(self.use["addresses"], parcel)
+        if direction:
+            df = df[df["DIRECTION"] == direction.upper()]
+        if category:
+            df = df[df["CATEGORY"] == category.upper()]
+        if changes_only:
+            df = df[df["CHANGE_BASE"] | df["CHANGE_OTHER"]]
+        return df.reset_index(drop=True)
+
+    def use_areas(self, parcel: Optional[str] = None, problems_only: bool = True) -> pd.DataFrame:
+        """Per block (one scheme in one building): source agreement and area verdict.
+        By default only coverage gaps and whole-block disagreements."""
+        self._need_use()
+        df = self._filter(self.use["blocks"], parcel)
+        if problems_only and not df.empty:
+            df = df[df["VERDICT"].isin(["OTHER_COVERAGE_GAP", "BASE_COVERAGE_GAP", "BLOCK_DISAGREEMENT"])]
+        return df.reset_index(drop=True)
+
+    def use_summary(self) -> pd.DataFrame:
+        """Per parcel: residential counts (base, other, reconciled dwellings) and categories."""
+        self._need_use()
+        return self.use["parcels"]
+
+    def source_reliability(self) -> pd.DataFrame:
+        """Fitted sensitivity/specificity of each source per context: how far each can be trusted."""
+        self._need_use()
+        return self.use["reliability"]
+
+    def use_category_summary(self) -> pd.DataFrame:
+        """Categories x direction, with what each category means."""
+        from .usage import CATEGORY_NOTES
+        self._need_use()
+        t = self.use["addresses"]
+        out = pd.crosstab(t["CATEGORY"], t["DIRECTION"]).reset_index()
+        out.insert(1, "MEANING", out["CATEGORY"].map(CATEGORY_NOTES))
+        return out
 
     # -------------------------------------------------------- 7. explain
     def explain(self, addr_id: str) -> Dict[str, object]:
@@ -268,6 +436,15 @@ class AssociatorSession:
                                                      group.preferred.pid)) if group else "not grouped",
                 "PAIRS": pd.DataFrame(pairs), "BLOCK_LINKS": pd.DataFrame(links),
             }
+            if self.use:
+                u = self.use["addresses"]
+                u = u[u.ADDR_ID == addr_id]
+                if len(u):
+                    x = u.iloc[0]
+                    out["USE"] = ("%s (P=%.2f) base=%s other=%s -> %s %s" % (
+                        x.RECONCILED_USE, x.P_DWELLING, x.BASE_RESIDENTIAL, x.OTHER_RESIDENTIAL, x.CATEGORY,
+                        x.SUGGESTED_ACTION)).strip()
+                    out["USE_EVIDENCE"] = x.EVIDENCE
             if self.verbose:
                 for k, v in out.items():
                     if not isinstance(v, pd.DataFrame):
@@ -281,6 +458,15 @@ class AssociatorSession:
         return parcel_text(self._results(parcel)[0], self.config)
 
     # ------------------------------------------------------- evaluation
+    def evaluate_use(self, truth: pd.DataFrame) -> Dict[str, object]:
+        """Score the use reconciliation against truth [ADDR_ID, ENTITY_ID, IS_DWELLING, ...]."""
+        from .evaluate import evaluate_use
+        self._need_use()
+        ev = evaluate_use(self.use["addresses"], truth)
+        self._say("use: decided accuracy %s, uncertain %.1f%%, %d true dwellings"
+                  % (ev["USE_ACCURACY_DECIDED"], 100 * ev["UNCERTAIN_SHARE"], ev["TRUE_DWELLINGS"]))
+        return ev
+
     def evaluate(self, truth: pd.DataFrame) -> Dict[str, object]:
         """Score against a truth table [ADDR_ID, ENTITY_ID, (SCENARIO)] (synthetic data)."""
         self._need_results()

@@ -18,6 +18,8 @@ INPUT_COLUMNS: List[str] = [
     "LOCALITY_NAME", "STATE_ABBREVIATION", "POSTCODE", "CADASTRE_POLYGON_PID",
 ]
 REQUIRED_COLUMNS = ["ADDR_ID", "CADASTRE_POLYGON_PID"]
+# Optional: used only by the residential-use reconciliation, never by matching.
+OPTIONAL_COLUMNS: List[str] = ["ADDRESS_TYPE"]
 
 # input column -> Address attribute
 COLUMN_TO_FIELD: Dict[str, str] = {
@@ -34,7 +36,7 @@ COLUMN_TO_FIELD: Dict[str, str] = {
     "NUMBER_LAST": "number_last", "NUMBER_LAST_SUFFIX": "number_last_suffix",
     "STREET_NAME": "street_name", "STREET_TYPE_CODE": "street_type",
     "STREET_SUFFIX_CODE": "street_suffix", "LOCALITY_NAME": "locality_name",
-    "STATE_ABBREVIATION": "state", "POSTCODE": "postcode",
+    "STATE_ABBREVIATION": "state", "POSTCODE": "postcode", "ADDRESS_TYPE": "address_type",
 }
 
 
@@ -69,6 +71,7 @@ class Address:
     locality_name: str = ""
     state: str = ""
     postcode: str = ""
+    address_type: str = ""
 
     @property
     def pid(self) -> str:

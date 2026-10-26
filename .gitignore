@@ -12,3 +12,6 @@ venv/
 .claude/
 .vscode/
 .idea/
+
+# generated HTML reports
+outputs/

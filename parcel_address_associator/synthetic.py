@@ -46,6 +46,7 @@ class _Builder:
         self.rows: List[dict] = []
         self.truth: List[dict] = []
         self.seen: Dict[tuple, str] = {}
+        self.first_of: Dict[str, str] = {}      # entity -> first ADDR_ID (the one a register counts)
         self.n_addr = 0
         self.n_par = 0
 
@@ -79,8 +80,54 @@ class _Builder:
             "LOCALITY_NAME": loc[0], "STATE_ABBREVIATION": "NSW", "POSTCODE": loc[1],
             "CADASTRE_POLYGON_PID": parcel,
         })
+        self.first_of.setdefault(entity, aid)
         self.truth.append({"ADDR_ID": aid, "ENTITY_ID": entity, "ENTITY_TYPE": etype,
                            "SCENARIO": scenario, "STYLE": style, "CADASTRE_POLYGON_PID": parcel})
+
+    # ------------------------------------------------------------------
+    def use_flags(self, seed: int) -> pd.DataFrame:
+        """Base ADDRESS_TYPE and a second dataset's RESIDENTIAL_DWELLING flag, each with
+        recorded errors. Returns the use DataFrame; fills ADDRESS_TYPE and truth columns."""
+        rng = random.Random(seed + 7)
+        etype = {t["ENTITY_ID"]: t["ENTITY_TYPE"] for t in self.truth}
+        dwelling_entities = sorted(e for e, t in etype.items() if t in ("DWELLING", "HOUSE"))
+        missed = {e for e in dwelling_entities if rng.random() < 0.03}
+        gap = {e for e in dwelling_entities if ":multi_tower:C:" in e}       # a whole tower missing
+        flags = []
+        for row, t in zip(self.rows, self.truth):
+            aid, ent, et = row["ADDR_ID"], t["ENTITY_ID"], t["ENTITY_TYPE"]
+            first = self.first_of[ent] == aid
+            base_err = other_err = ""
+            if et == "DWELLING":
+                atype = "SHELL_CHILD"
+                if rng.random() < 0.015:
+                    atype, base_err = "COMMERCIAL", "dwelling_not_flagged"
+            elif et == "HOUSE":
+                atype = "RESIDENTIAL_DWELLING"
+            elif et in ("BUILDING", "SITE"):
+                atype = "SHELL_PARENT"
+                if rng.random() < 0.35:
+                    atype, base_err = "RESIDENTIAL_DWELLING", "building_flagged"
+            else:
+                atype = "COMMERCIAL"
+                if rng.random() < 0.06:
+                    atype, base_err = "SHELL_CHILD", "commercial_flagged"
+            if et in ("DWELLING", "HOUSE"):
+                res = first
+                if first and ent in gap:
+                    res, other_err = False, "block_missed"
+                elif first and ent in missed:
+                    res, other_err = False, "dwelling_missed"
+            else:
+                res = False
+                if rng.random() < 0.03:
+                    res, other_err = True, ("building_flagged" if et in ("BUILDING", "SITE")
+                                            else "commercial_flagged")
+            row["ADDRESS_TYPE"] = atype
+            t.update({"IS_DWELLING": et in ("DWELLING", "HOUSE"), "BASE_ERROR": base_err,
+                      "OTHER_ERROR": other_err})
+            flags.append({"ADDR_ID": aid, "RESIDENTIAL_DWELLING": "Y" if res else "N"})
+        return pd.DataFrame(flags)
 
     # ------------------------------------------------------------------
     def single_tower(self, loc, tag):
@@ -276,8 +323,14 @@ class _Builder:
                              lot=str(self.rng.randint(10, 400)))
 
 
-def make_synthetic(seed: int = 42, replicates: int = 1) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Return (input DataFrame in INPUT_COLUMNS order, truth DataFrame)."""
+def make_synthetic(seed: int = 42, replicates: int = 1, with_use: bool = False):
+    """Return (input DataFrame, truth DataFrame), or with ``with_use=True``
+    (input, truth, use DataFrame [ADDR_ID, RESIDENTIAL_DWELLING]).
+
+    The input has INPUT_COLUMNS plus ADDRESS_TYPE. Truth has ENTITY_ID (shared by
+    duplicates), ENTITY_TYPE, SCENARIO, STYLE, IS_DWELLING and the errors injected
+    into each use source (BASE_ERROR, OTHER_ERROR).
+    """
     b = _Builder(seed)
     for r in range(replicates):
         loc = LOCALITIES[r % len(LOCALITIES)]
@@ -294,9 +347,13 @@ def make_synthetic(seed: int = 42, replicates: int = 1) -> Tuple[pd.DataFrame, p
         b.townhouse_mix(loc, tag)
         b.mixed_use(loc, tag)
         b.background(loc, tag)
-    df = pd.DataFrame(b.rows, columns=INPUT_COLUMNS)
+    use = b.use_flags(seed)
+    df = pd.DataFrame(b.rows, columns=INPUT_COLUMNS + ["ADDRESS_TYPE"])
     truth = pd.DataFrame(b.truth)
     # shuffle so nothing relies on input order
     order = list(range(len(df)))
     random.Random(seed + 1).shuffle(order)
-    return df.iloc[order].reset_index(drop=True), truth.iloc[order].reset_index(drop=True)
+    df, truth = df.iloc[order].reset_index(drop=True), truth.iloc[order].reset_index(drop=True)
+    if with_use:
+        return df, truth, use.iloc[order].reset_index(drop=True)
+    return df, truth

@@ -54,6 +54,35 @@ class Config:
     review_min_p: float = 0.6              # rank mappings this good before the rank penalty
     review_size_ratio: float = 0.75        # ...between blocks of similar size
 
+    # ---- residential-use reconciliation -------------------------------------
+    residential_address_types: tuple = ("RESIDENTIAL_DWELLING", "SHELL_CHILD")
+    # structural prior (log-odds that a premise is a dwelling) by context
+    use_prior: Dict[str, float] = field(default_factory=lambda: {
+        "unit": 1.5,          # UNIT/APT/FLAT/TOWNHOUSE/VILLA... sub-address
+        "commercial": -2.0,   # SHOP/SUITE/OFFICE/TENANCY...
+        "ancillary": -2.5,    # CARSPACE/STORE/GARAGE...
+        "other_sub": -0.5,    # level-only or unrecognised flat type
+        "building": -6.0,     # parent address heading a building or site: not a dwelling
+                              # unless both sources insist (then UNCERTAIN, for review)
+        "standalone": 0.5,    # parent address with no sub-addresses (e.g. a house)
+    })
+    w_use_peers: float = 1.0               # premises in the same block (same scheme, building)
+    use_peers_cap: float = 3.0
+    w_use_floor: float = 0.5               # premises on the same floor of the same structure
+    use_floor_cap: float = 2.0
+    use_source_cap: float = 3.0            # no single source's flag outweighs structure + peers alone
+    use_reliability_prior: float = 0.9     # starting sensitivity/specificity of each source
+    use_reliability_strength: float = 10.0 # pseudo-count weight of that prior
+    use_reliability_bounds: tuple = (0.6, 0.995)
+    # area patterns: a block where one source says residential and the other does not
+    # for (nearly) every premise
+    use_gap_share: float = 0.8             # share of the block's premises disagreeing one way
+    use_gap_min_premises: int = 3
+    use_gap_support_share: float = 0.8     # same style/structure elsewhere agreed residential
+    use_iterations: int = 15
+    use_res_threshold: float = 0.8         # P(dwelling) at or above -> RESIDENTIAL
+    use_non_threshold: float = 0.2         # at or below -> NOT_RESIDENTIAL; between -> UNCERTAIN
+
     # ---- output bands -------------------------------------------------------
     band_high: float = 0.85
     band_medium: float = 0.6
