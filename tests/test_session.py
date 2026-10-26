@@ -1,5 +1,6 @@
 """End-to-end tests through the notebook session on a seed not used for tuning."""
 import unittest
+from pathlib import Path
 
 import pandas as pd
 
@@ -84,12 +85,12 @@ class EndToEnd(unittest.TestCase):
         pid = self.s.interesting_parcels(1)[0]
         path = self.s.save_html(os.path.join(d, "nested", "one.html"), parcels=[pid])
         self.assertTrue(os.path.isfile(path))
-        doc = open(path, encoding="utf-8").read()
+        doc = Path(path).read_text(encoding="utf-8")
         self.assertTrue(doc.startswith("<!doctype html>"))
         self.assertEqual(doc.count("<section"), 1)
         self.assertIn("<svg", doc)
         self.assertNotIn("<script", doc)
-        full = open(self.s.save_html(os.path.join(d, "all.html"), max_parcels=5), encoding="utf-8").read()
+        full = Path(self.s.save_html(os.path.join(d, "all.html"), max_parcels=5)).read_text(encoding="utf-8")
         self.assertEqual(full.count("<section"), 5)
 
     def test_views(self):

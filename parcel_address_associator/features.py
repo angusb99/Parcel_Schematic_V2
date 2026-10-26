@@ -86,6 +86,7 @@ class Feat:
     block_id: str = ""
     keys: Dict[str, object] = field(default_factory=dict)
     position: Optional[Tuple[float, str]] = None   # (level ordinal, unit label) for schematics
+    encoded_number: bool = False  # level-encoded door number (e.g. 405) in a numbered scheme
 
     @property
     def label(self) -> str:

@@ -61,6 +61,7 @@ class Transform:
     quality: float
     extent_frac: float = 1.0     # share of the larger block's keys inside the smaller block's extent
     n_small: int = 0             # keys in the smaller block
+    extent_nested: bool = False  # smaller block's extent lies inside the larger one's
 
     @property
     def m(self) -> int:
@@ -77,7 +78,7 @@ class Transform:
     def describe(self) -> str:
         s = FORM_NAMES.get((self.fx, self.fy), "%s->%s" % (self.fx, self.fy))
         if self.offset:
-            s += " with level offset %+d" % self.offset
+            s += " with level offset %+d (ground floor counted as level 1)" % self.offset
         return s
 
 
@@ -162,11 +163,29 @@ def _iou(a, b) -> float:
     return ix / union if union > 0 else 0.0
 
 
+def offset_admissible(X: Block, Y: Block, off: float) -> bool:
+    """A level offset (Y level = X level + off) is only a floor-naming convention:
+    one scheme names a ground floor (G01, GROUND) and a scheme whose levels come from
+    LEVEL labels counts that floor as level 1. Two schemes whose levels both come from
+    the door numbers never differ by a floor: 405 is 405 in every source."""
+    if X.level_source != "label" and Y.level_source != "label":
+        return False
+    if off == 1:
+        return X.has_ground and not Y.has_ground
+    if off == -1:
+        return Y.has_ground and not X.has_ground
+    return False
+
+
 def best_transform(X: Block, Y: Block, cfg: Config) -> Optional[Transform]:
     """Search the transform family; quality blends how fully the smaller block is
     explained (containment) with how well the two layouts' extents agree."""
     cands: List[Transform] = []
     both_lu = X.valid["lu"] and Y.valid["lu"]
+    # (level, unit-on-level) grids are only comparable when both 'units' are positions
+    # on a floor, not full door numbers (explicit+sequential keeps the whole number)
+    on_floor = ("encoded", "explicit+encoded", "explicit+per-level", "prefix-level")
+    grid_ok = both_lu and X.model in on_floor and Y.model in on_floor
 
     def consider(fx: str, fy: str, off: float, matched):
         nx, ny = len(X.keys[fx]), len(Y.keys[fy])
@@ -175,17 +194,25 @@ def best_transform(X: Block, Y: Block, cfg: Config) -> Optional[Transform]:
         pen_key = "seqnum" if {fx, fy} == {"seq", "num"} else fx
         pen = cfg.form_penalty.get(pen_key, 0.0) + (cfg.offset_penalty if off else 0.0)
         t = Transform(fx, fy, off, matched, nx, ny, 0.0)
+        two_d = True
         if fx in ("lu", "lr"):
             px, py = _points(X.keys[fx], True, off), _points(Y.keys[fy], True)
-        elif fx == "raw" and both_lu:
+        elif fx == "raw" and grid_ok:
             px, py = _points(X.keys["lu"], True), _points(Y.keys["lu"], True)
         else:
             px, py = _points(X.keys[fx], False), _points(Y.keys[fy], False)
+            two_d = False
         ext = _iou(_bounds(px), _bounds(py))
         small, large = (px, py) if len(px) <= len(py) else (py, px)
-        sb = _bounds(small)
+        sb, lb = _bounds(small), _bounds(large)
         inside = sum(1 for p in large if sb[0] <= p[0] <= sb[1] and sb[2] <= p[1] <= sb[3])
         t.extent_frac, t.n_small = inside / len(large), len(small)
+        nested = lb[0] <= sb[0] and sb[1] <= lb[1] and lb[2] <= sb[2] and sb[3] <= lb[3]
+        if two_d:
+            # a source missing some floors keeps the full floor plate; a smaller
+            # building inside a bigger one's numbering has a narrower one
+            nested = nested and (sb[3] - sb[2]) < (lb[3] - lb[2])
+        t.extent_nested = nested
         w = cfg.w_containment
         t.quality = w * t.containment + (1 - w) * ext - pen
         cands.append(t)
@@ -196,6 +223,8 @@ def best_transform(X: Block, Y: Block, cfg: Config) -> Optional[Transform]:
     if both_lu:
         ky = Y.keys["lu"]
         for off in (0, -1, 1):
+            if off and not offset_admissible(X, Y, off):
+                continue
             m = [(k, (k[0] + off, k[1])) for k in X.keys["lu"] if (k[0] + off, k[1]) in ky]
             if off and len({k[0] for k, _ in m}) < 2:
                 continue        # a level offset must hold across several levels
@@ -206,6 +235,8 @@ def best_transform(X: Block, Y: Block, cfg: Config) -> Optional[Transform]:
         cx = Counter(k[0] for k in X.keys["lr"])
         cy = Counter(k[0] for k in Y.keys["lr"])
         for off in (0, -1, 1):
+            if off and not offset_admissible(X, Y, off):
+                continue
             ok_levels = {lv for lv, n in cx.items() if cy.get(lv + off) == n}
             if len(ok_levels) < 2:
                 continue
@@ -249,9 +280,12 @@ def score_link(X: Block, Y: Block, t: Transform, cfg: Config) -> BlockLink:
     add(q_term, "%s explains %d of %d/%d keys" % (t.describe(), t.m, t.nx, t.ny))
     if t.m < cfg.min_support:
         add(cfg.w_low_support * (cfg.min_support - t.m), "only %d matched" % t.m)
-    if not t.rank_based and t.n_small >= cfg.extent_min_keys and t.extent_frac < 1.0:
+    if (not t.rank_based and t.extent_nested and t.n_small >= cfg.extent_min_keys
+            and t.extent_frac < 1.0):
         # If the smaller block were a sample of the larger, its keys would spread over
         # the larger one's whole layout; P(all inside a sub-extent) ~ frac ** n.
+        # Only for nested layouts (a smaller building inside a bigger one's range):
+        # partly overlapping layouts are two sources covering different floors.
         llr = cfg.w_extent_llr * min(t.n_small, 40) * math.log(max(t.extent_frac, 1e-3))
         llr = max(-cfg.extent_llr_cap, llr)
         if llr < -0.2:

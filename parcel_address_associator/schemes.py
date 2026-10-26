@@ -78,6 +78,21 @@ class Block:
         return len(self.feats)
 
     @property
+    def level_source(self) -> str:
+        """'number' when levels come from the unit numbers themselves (1103 -> L11),
+        'label' when they come from LEVEL fields or level prefixes (G01), which can
+        follow a different floor-naming convention."""
+        if self.model in ("explicit+per-level", "explicit+sequential", "prefix-level", "level-only"):
+            return "label"
+        if any(f.pfx_role == "level" for f in self.feats):
+            return "label"
+        return "number"
+
+    @property
+    def has_ground(self) -> bool:
+        return any(lu[0] == 0.0 for lu in self.keys.get("lu", {}))
+
+    @property
     def ref(self) -> Tuple[str, str]:
         """Building reference for cross-style comparison (name first, then prefix)."""
         if self.bref[0]:
@@ -189,14 +204,19 @@ def _assign_levels(block: Block) -> Tuple[Dict[int, Optional[float]], Dict[int, 
     if len(explicit) >= 0.6 * len(fs):
         ex_num = [f for f in explicit if f.num is not None]
         hits = sum(1 for f in ex_num if _encodes(f.num, f.lvl_ord))
-        if ex_num and hits >= 0.8 * len(ex_num):
+        # level-encoded door numbers decide it even when some LEVEL fields disagree
+        if ex_num and (hits >= 0.8 * len(ex_num) or detect_encoded([f.num for f in ex_num])):
             block.model = "explicit+encoded"
             for f in fs:
                 if f.num is None:
                     lvl[id(f)], unit[id(f)] = f.lvl_ord, None
                     continue
-                lv = f.lvl_ord if f.lvl_ord is not None else (float(f.num // 100) if f.num >= 100 else None)
-                lvl[id(f)], unit[id(f)] = lv, (f.num % 100 if f.num >= 100 else f.num)
+                if f.num >= 100:
+                    # the door number wins over a LEVEL field that contradicts it
+                    # ('UNIT 505, LEVEL 4' is unit 5 on level 5)
+                    lvl[id(f)], unit[id(f)] = float(f.num // 100), f.num % 100
+                else:
+                    lvl[id(f)], unit[id(f)] = f.lvl_ord, f.num
         else:
             seen = defaultdict(set)
             for f in ex_num:
@@ -242,8 +262,11 @@ def build_keys(block: Block) -> None:
     lvl, unit = _assign_levels(block)
     keys: Dict[str, Dict[object, List[Feat]]] = {k: defaultdict(list) for k in
                                                  ("raw", "lu", "lr", "seq", "num")}
+    door_numbers = block.model in ("encoded", "explicit+encoded")
     for f in block.feats:
         f.keys = {}
+        # a level-encoded door number (405) identifies one unit in every source
+        f.encoded_number = door_numbers and f.num is not None and f.num >= 100 and f.pfx_role != "level"
         raw = _raw_key(f)
         if raw:
             keys["raw"][raw].append(f)

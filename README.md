@@ -154,31 +154,34 @@ differently, so validate on a hand-checked sample of your own parcels.
 |---|---|
 | style | addresses grouped by format: flat type, building prefix or name, explicit level, base shape (single number, range, lot) |
 | block | one style on one context (base address + building reference): what that scheme says is in one building |
-| numbering model | `encoded` (1103 = L11 U3), `explicit+per-level` (`UNIT 3, LEVEL 11`), `explicit+sequential`, `prefix-level` (G01), `plain`; two schemes sharing one format and base are split apart |
-| mapping | for each pair of blocks, the transform explaining most records: same identifier; level + unit (± level offset, e.g. ground counted as level 1); position within level; position through the building |
-| evidence | log-odds from coverage, layout extent (a 12-level block is not a sample of an 18-level tower), building references (`TOWER A` = prefix `A`), base relationship, same-style prior |
+| numbering model | `encoded` (1103 = L11 U3), `explicit+encoded` (`UNIT 1103, LEVEL 11`: the door number wins when the level field disagrees), `explicit+per-level` (`UNIT 3, LEVEL 11`), `explicit+sequential`, `prefix-level` (G01), `plain`; two schemes sharing one format and base are split apart |
+| mapping | for each pair of blocks, the transform explaining most records: same identifier; level + unit; position within level; position through the building. A level offset of ±1 is only allowed as a ground-floor convention: the side with a ground floor (G01, level 0) is the one counting from 0, and the other side must take its levels from a level field or prefix, never from a door number. So `UNIT 405` never maps to `UNIT 505` |
+| evidence | log-odds from coverage, layout extent (a block with a narrower floor plate nested inside another is a smaller building, not a sample; a source missing some floors keeps the full plate and is not penalised), building references (`TOWER A` = prefix `A`), base relationship, same-style prior |
 | exclusivity | a block maps to one building per style unless it spans several; near-ties become `AMBIGUOUS_BUILDING` review pairs |
 | structures | linked blocks form inferred buildings, drawn as stacking plans |
-| groups | record pairs grouped so no group holds two different units of one scheme |
+| groups | record pairs grouped so no group holds two different units of one scheme, and never two different encoded door numbers (`UNIT 405` / `UNIT 505`) whatever the mapping says |
 | parents | site and building addresses (no flat or level) paired when they refer to the same building |
 
 ## Results on synthetic data
 
 `make_synthetic(seed, replicates)` builds a fictional town of precincts, each reproducing
-a duplicate pattern. On seeds not used for tuning (1, 7, 123, 2024 ×2, 99 ×4; up to 8,365
-rows in 1.2 s):
+a duplicate pattern. On seeds not used for tuning (1, 7, 123, 2024 ×2, 99 ×4; up to 8,987
+rows in 1.1 s):
 
 * **Resolvable scenarios:** precision 1.000 and recall 1.000. These are single tower,
   multi-tower, corner frontage, ground-floor convention, twin towers with letters,
-  mixed use and background. The exception is one seed where a 3-unit rear-lane source
-  was too small to link.
+  mixed use and background.
+* **Staggered coverage** (sources covering different floor ranges of one tower, e.g.
+  levels 1–8 vs 3–10, plus a level field that is sometimes off by one): precision 1.000,
+  recall 0.99–1.00. No pair ever joins two different door numbers; the few misses are
+  small partial sources left unlinked.
 * **Two scenarios are not decidable from this schema, by design:**
   * *strata-lot numbering:* `UNIT 5` vs `UNIT 105`, where the order matches but nothing
     confirms it;
   * *identical twin towers:* street numbers vs EAST/WEST TOWER names.
 
   They produce no groups and no false positives; their true pairs are all in
-  `review_candidates()`. Overall grouped recall is about 0.87, and about 0.998 if the
+  `review_candidates()`. Overall grouped recall is about 0.89, and about 0.998 if the
   review list is included.
 
 These are consistency checks on scenarios written alongside the engine, not accuracy on

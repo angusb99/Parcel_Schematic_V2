@@ -29,6 +29,9 @@ SCENARIOS = {
     "strata_lot_numbering": "Level-encoded unit numbers vs strata-lot order (UNIT 1..63) on the same "
                             "base. Not confirmable from components alone: expect REVIEW candidates.",
     "level_convention": "Ground floor as G-prefix (G01) vs a source that counts ground as LEVEL 1.",
+    "staggered_coverage": "Sources covering different floor ranges of one building (levels 1-8 vs "
+                          "3-10 vs 2-7), plus one whose LEVEL field sometimes contradicts its door "
+                          "number. Must match same numbers only, never UNIT 405 with UNIT 505.",
     "twin_towers": "Two identical towers, prefix A/B vs TOWER A/B names: the letters resolve them.",
     "twin_towers_unresolved": "Identical towers, street numbers vs EAST/WEST TOWER names: nothing "
                               "separates them, so expect AMBIGUOUS review candidates, not guesses.",
@@ -232,6 +235,29 @@ class _Builder:
                     self.add(P, loc, sc, d, "DWELLING", "S2 UNIT {U}, LEVEL {L+1}", st, 30, None, "UNIT",
                              fnum=u, lt="L", lnum=L + 1)
 
+    def staggered_coverage(self, loc, tag):
+        P, sc, st = self.parcel(), "staggered_coverage", ("REGATTA", "ROAD")
+        e = lambda *k: ":".join((tag, sc) + tuple(str(x) for x in k))
+        self.add(P, loc, sc, e("BLDG"), "BUILDING", "P:range", st, 20, 26)
+        self.add(P, loc, sc, e("BLDG"), "BUILDING", "P:single", st, 20)
+        for L in range(1, 11):
+            for u in range(1, 7):
+                d = e(L, u)
+                if L <= 8 and self.maybe(0.9):
+                    self.add(P, loc, sc, d, "DWELLING", "S1 UNIT {L}{UU} range, levels 1-8", st, 20, 26,
+                             "UNIT", fnum=L * 100 + u)
+                if L >= 3 and self.maybe(0.9):
+                    self.add(P, loc, sc, d, "DWELLING", "S2 UNIT {L}{UU} single, levels 3-10", st, 20, None,
+                             "UNIT", fnum=L * 100 + u)
+                if 2 <= L <= 7 and self.maybe(0.8):
+                    self.add(P, loc, sc, d, "DWELLING", "S3 UNIT {U}, LEVEL {L}, levels 2-7", st, 20, None,
+                             "UNIT", fnum=u, lt="L", lnum=L)
+                if self.maybe(0.5):
+                    # LEVEL field occasionally one out from the door number
+                    lnum = L + (1 if self.maybe(0.15) else 0)
+                    self.add(P, loc, sc, d, "DWELLING", "S4 APARTMENT {L}{UU}, LEVEL {L}", st, 20, None,
+                             "APT", fnum=L * 100 + u, lt="L", lnum=lnum)
+
     def twin_towers(self, loc, tag, resolvable: bool = True):
         sc = "twin_towers" if resolvable else "twin_towers_unresolved"
         P, st = self.parcel(), ("SKYLINE", "BOULEVARD")
@@ -342,6 +368,7 @@ def make_synthetic(seed: int = 42, replicates: int = 1, with_use: bool = False):
         b.corner_frontage(loc, tag)
         b.strata_lot_numbering(loc, tag)
         b.level_convention(loc, tag)
+        b.staggered_coverage(loc, tag)
         b.twin_towers(loc, tag, resolvable=True)
         b.twin_towers(loc, tag, resolvable=False)
         b.townhouse_mix(loc, tag)

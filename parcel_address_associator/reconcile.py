@@ -87,8 +87,11 @@ class ParcelResult:
 # --------------------------------------------------------------------------
 
 def record_ok(fa: Feat, fb: Feat, t_form: str = "", offset: float = 0.0) -> bool:
-    """Record-level veto: explicit levels that contradict the mapping."""
+    """Record-level veto: explicit levels that contradict the mapping, or two
+    level-encoded door numbers that differ (UNIT 405 is never UNIT 505)."""
     if fa.pid == fb.pid:
+        return False
+    if fa.encoded_number and fb.encoded_number and fa.keys.get("raw") != fb.keys.get("raw"):
         return False
     if fa.lvl_ord is not None and fb.lvl_ord is not None and t_form in ("raw", "lu", "exact"):
         if fb.lvl_ord != fa.lvl_ord + offset:
