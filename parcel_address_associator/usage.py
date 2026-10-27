@@ -42,7 +42,8 @@ SOURCES = ("BASE", "OTHER")
 CATEGORY_NOTES = {
     "OK": "sources agree with the reconciled use",
     "DUPLICATE_OF_COUNTED_DWELLING": "same dwelling as another ADDR_ID that is (or should be) the one counted",
-    "BUILDING_OR_SITE_ADDRESS": "address of a building or site that holds units; not itself a dwelling",
+    "BUILDING_OR_SITE_ADDRESS": "address of a building or site that holds units, or a shell found by "
+                                "detect_shells(); not itself a dwelling",
     "MISSED_BY_OTHER": "residential premise the second dataset does not count",
     "MISSED_BY_BASE": "residential premise the base ADDRESS_TYPE does not count",
     "MISSED_BY_BOTH": "structure says residential although neither source does (check)",
@@ -156,9 +157,26 @@ def _context(members: List[Feat], role: str) -> str:
     return "other_sub"
 
 
+def _shell_context(ctx: str, members: List[Feat], shell: Optional[Dict[str, str]]) -> str:
+    """Shell detection (when run) overrides the structural context: a shell is a
+    building/site/common-property address; a parent it clears is a standalone dwelling;
+    a possible shell parent gets a mild prior and the sources decide."""
+    if not shell:
+        return ctx
+    verdicts = [shell.get(f.pid) for f in members]
+    if "SHELL" in verdicts:
+        return "building"
+    if ctx in ("building", "standalone") and "POSSIBLE_SHELL" in verdicts:
+        return "possible_shell"
+    if ctx == "building" and verdicts and all(v == "NOT_SHELL" for v in verdicts):
+        return "standalone"
+    return ctx
+
+
 def build_premises(results: Iterable[ParcelResult], extra: List[Address], base: Dict[str, Optional[bool]],
                    other: Dict[str, Optional[bool]],
-                   partners: Optional[Dict[str, Set[str]]] = None
+                   partners: Optional[Dict[str, Set[str]]] = None,
+                   shell: Optional[Dict[str, str]] = None
                    ) -> Tuple[List[Premise], Dict[Tuple[str, str], BlockInfo]]:
     premises: List[Premise] = []
     blocks: Dict[Tuple[str, str], BlockInfo] = {}
@@ -190,7 +208,8 @@ def build_premises(results: Iterable[ParcelResult], extra: List[Address], base: 
         for gid, members, pref in units:
             roles = [role.get(f.pid, "") for f in members if not f.is_sub]
             r_role = "BUILDING" if any(x in ("BUILDING", "SITE") for x in roles) else "STANDALONE"
-            pr = Premise(len(premises), r.parcel, gid, members, _context(members, r_role), pref)
+            pr = Premise(len(premises), r.parcel, gid, members,
+                         _shell_context(_context(members, r_role), members, shell), pref)
             pr.blocks = {(r.parcel, f.block_id) for f in members if f.block_id}
             pr.floor = next((cell[f.pid] for f in members if f.pid in cell), None)
             pr.base, pr.other = vote(base, members), vote(other, members)
@@ -202,7 +221,8 @@ def build_premises(results: Iterable[ParcelResult], extra: List[Address], base: 
             premises.append(pr)
     for a in extra:                                   # parcels too small to analyse, or no parcel
         f = build_feat(a)
-        pr = Premise(len(premises), a.parcel, "", [f], _context([f], "STANDALONE"), f.pid)
+        pr = Premise(len(premises), a.parcel, "", [f], _shell_context(_context([f], "STANDALONE"), [f], shell),
+                     f.pid)
         pr.base, pr.other = vote(base, [f]), vote(other, [f])
         premises.append(pr)
     return premises, blocks

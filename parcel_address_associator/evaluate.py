@@ -76,6 +76,43 @@ def evaluate_use(use: pd.DataFrame, truth: pd.DataFrame) -> Dict[str, object]:
     return out
 
 
+def evaluate_shells(shells: pd.DataFrame, truth: pd.DataFrame) -> Dict[str, object]:
+    """Score shell detection against truth [ADDR_ID, SHELL_CLASS ('' = not a shell),
+    (SCENARIO)]. A SHELL verdict is a positive; POSSIBLE_SHELL is reported apart."""
+    t = truth.copy()
+    t.columns = [c.upper() for c in t.columns]
+    t = t[["ADDR_ID", "SHELL_CLASS"] + (["SCENARIO"] if "SCENARIO" in t.columns else [])]
+    m = shells.merge(t.rename(columns={"SHELL_CLASS": "TRUE_CLASS"}), on="ADDR_ID")
+    m["TRUE_CLASS"] = m["TRUE_CLASS"].fillna("")
+    if "SCENARIO" not in m.columns:
+        m["SCENARIO"] = "?"
+
+    def score(d: pd.DataFrame) -> Dict[str, object]:
+        true, pred, poss = d["TRUE_CLASS"] != "", d["VERDICT"] == "SHELL", d["VERDICT"] == "POSSIBLE_SHELL"
+        out = _prf(int((pred & true).sum()), int((pred & ~true).sum()), int((~pred & true).sum()))
+        hit = d[pred & true]
+        out["CLASS_ACCURACY"] = round(float((hit["SHELL_CLASS"] == hit["TRUE_CLASS"]).mean()), 4) if len(hit) else None
+        out["POSSIBLE_TRUE"], out["POSSIBLE_FALSE"] = int((poss & true).sum()), int((poss & ~true).sum())
+        return out
+
+    rows = []
+    for k, d in m.groupby("SCENARIO"):
+        r = score(d)
+        r["SCENARIO"] = k
+        rows.append(r)
+    flag = (m["TRUE_CLASS"] != "") | (m["VERDICT"] != "NOT_SHELL")
+    shown = lambda s: s.replace("", "(none)")
+    confusion = pd.crosstab(shown(m.loc[flag, "TRUE_CLASS"]).rename("TRUE_CLASS"),
+                            (m.loc[flag, "VERDICT"] + " " + m.loc[flag, "SHELL_CLASS"]).str.strip().rename("PREDICTED"))
+    wrong = ((m["VERDICT"] == "SHELL") != (m["TRUE_CLASS"] != ""))
+    cols = ["ADDR_ID", "LABEL", "SCENARIO", "TRUE_CLASS", "VERDICT", "SHELL_CLASS", "P_SHELL", "EVIDENCE"]
+    return {"overall": score(m),
+            "by_scenario": pd.DataFrame(rows, columns=["SCENARIO", "PRECISION", "RECALL", "F1", "TP", "FP", "FN",
+                                                       "CLASS_ACCURACY", "POSSIBLE_TRUE", "POSSIBLE_FALSE"]),
+            "confusion": confusion,
+            "errors": m.loc[wrong, cols].sort_values(["SCENARIO", "LABEL"]).reset_index(drop=True)}
+
+
 def evaluate(results: Iterable[ParcelResult], truth: pd.DataFrame) -> Dict[str, object]:
     results = list(results)
     t = truth.copy()

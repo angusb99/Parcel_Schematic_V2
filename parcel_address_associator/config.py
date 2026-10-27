@@ -65,6 +65,7 @@ class Config:
         "building": -6.0,     # parent address heading a building or site: not a dwelling
                               # unless both sources insist (then UNCERTAIN, for review)
         "standalone": 0.5,    # parent address with no sub-addresses (e.g. a house)
+        "possible_shell": -1.0,  # parent detect_shells() could not settle (e.g. a front house)
     })
     w_use_peers: float = 1.0               # premises in the same block (same scheme, building)
     use_peers_cap: float = 3.0
@@ -82,6 +83,50 @@ class Config:
     use_iterations: int = 15
     use_res_threshold: float = 0.8         # P(dwelling) at or above -> RESIDENTIAL
     use_non_threshold: float = 0.2         # at or below -> NOT_RESIDENTIAL; between -> UNCERTAIN
+
+    # ---- shell detection ----------------------------------------------------
+    shell_address_types: tuple = ("SHELL_PARENT",)   # ADDRESS_TYPE values that mark a shell
+    # prior log-odds that an address is a shell, by what kind of address it is
+    shell_prior: Dict[str, float] = field(default_factory=lambda: {
+        "parent": -1.5,        # no flat or level: a house, or a building/site over sub-addresses
+        "unit": -5.0,          # UNIT/APT/FLAT/TOWNHOUSE/VILLA...
+        "commercial": -4.0,    # SHOP/SUITE/OFFICE...
+        "private_lot": -3.5,   # CARSPACE/STORE/GARAGE: someone's lot, not common property
+        "common_type": 3.0,    # LOBBY/CARPARK/SUBSTATION/BBQ/ANTENNA/SIGN...
+        "building_type": 2.5,  # BUILDING/BLOCK/TOWER n, SITE n
+        "common_level": 2.5,   # BASEMENT/PARKING/PODIUM/ROOFTOP with no flat
+        "floor": 0.0,          # LEVEL n with no flat: a whole floor, for review
+        "other_sub": -1.5,
+    })
+    w_shell_children: float = 1.6          # * log2(1 + sub-address premises below the parent), capped
+    shell_children_cap: float = 3.0
+    w_shell_cross_parcel: float = 1.4      # the same, for premises on neighbouring parcels
+    shell_cross_parcel_m: float = 150.0
+    w_shell_no_children: float = -2.5      # parent with nothing below it: a house or a lot address
+    w_shell_range: float = 0.8             # range street number (20-26) on a parent
+    w_shell_keyword: float = 4.0           # COMMON PROPERTY, CAR PARK, SUBSTATION... in the building name
+    # geometry (only when parcels/footprints are attached). Geocodes at the parcel centroid
+    # (most G-NAF records) say nothing about which building an address is in: only
+    # building-level geocodes feed the point rules below.
+    shell_property_point_m: float = 2.0    # geocode this close to the parcel centroid/label point
+    w_shell_geo_with_children: float = 1.0  # parent geocoded in a footprint that holds its sub-addresses
+    w_shell_geo_own_building: float = -3.0  # parent alone in its own footprint, sub-addresses elsewhere
+    w_shell_geo_unaddressed: float = -1.5   # parent off-footprint; a house-sized footprint holds no
+    shell_house_min_m2: float = 60.0        # address while its sub-addresses are in other footprints
+    w_shell_geo_bare_parcel: float = 1.0    # parent on a parcel with no building, premises next door
+    # parcel-level, used when the parent has no building-level geocode (one building holding
+    # all the parcel's premises reuses w_shell_geo_with_children):
+    w_shell_geo_spare_building: float = -2.0  # more dwelling-sized buildings than the parcel's premises
+    shell_spare_building_max: int = 6         # ...on parcels with at most this many premises
+    w_shell_geo_small_scheme: float = -1.0    # a few premises spread over several buildings
+    shell_small_scheme: int = 3               # 'a few'
+    w_shell_geo_tiny_footprint: float = 1.5  # non-dwelling sub-address in a kiosk-sized footprint
+    shell_tiny_footprint_m2: float = 25.0
+    shell_snap_m: float = 1.0              # geocode this close to a footprint counts as inside it
+    shell_off_parcel_m: float = 25.0       # geocode further than this outside its parcel is ignored
+    shell_site_share: float = 0.2          # sub-addresses outside the main footprint -> SITE
+    shell_threshold: float = 0.8           # P(shell) at or above -> SHELL
+    shell_possible: float = 0.5            # at or above -> POSSIBLE_SHELL (review)
 
     # ---- output bands -------------------------------------------------------
     band_high: float = 0.85

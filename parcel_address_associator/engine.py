@@ -9,7 +9,7 @@ import pandas as pd
 
 from . import codes
 from .config import Config
-from .model import INPUT_COLUMNS, OPTIONAL_COLUMNS, REQUIRED_COLUMNS, Address
+from .model import GEO_COLUMNS, INPUT_COLUMNS, OPTIONAL_COLUMNS, REQUIRED_COLUMNS, Address
 from .reconcile import ParcelResult, analyse_parcel
 
 _IDENT = re.compile(r"^([A-Z]*)(\d+)([A-Z]*)$")
@@ -82,6 +82,7 @@ def prepare_input(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
             out[c] = ""
             issue("optional_column_absent", "info", len(df), "%s not supplied; use reconciliation "
                   "will rely on the second dataset alone" % c)
+    _geocodes(df, lookup, out, issue)
     n_in = len(out)
 
     blank = out["ADDR_ID"] == ""
@@ -129,6 +130,35 @@ def prepare_input(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     issue("rows_accepted", "info", len(out), "%d of %d input rows accepted" % (len(out), n_in))
     issues_df = pd.DataFrame(issues, columns=["CHECK", "SEVERITY", "ROWS", "DETAIL", "EXAMPLE_ADDR_IDS"])
     return out.reset_index(drop=True), issues_df
+
+
+def _geocodes(df: pd.DataFrame, lookup: Dict[str, str], out: pd.DataFrame, issue) -> None:
+    """LATITUDE / LONGITUDE -> floats (NaN when absent or unusable)."""
+    present = [c for c in GEO_COLUMNS if c in lookup]
+    if len(present) < len(GEO_COLUMNS):
+        for c in GEO_COLUMNS:
+            out[c] = float("nan")
+        issue("geocodes_absent", "info", len(df), "LATITUDE/LONGITUDE not supplied; shell detection "
+              "uses address text and parcel linkage only")
+        return
+    for c in GEO_COLUMNS:
+        raw = df[lookup[c]]
+        v = pd.to_numeric(raw, errors="coerce").astype(float)
+        bad = v.isna() & (clean_text(raw) != "")
+        issue("non_numeric_coordinate", "warning", bad, "%s not numeric; treated as missing" % c,
+              out.loc[bad, "ADDR_ID"])
+        out[c] = v
+    lat, lon = out["LATITUDE"], out["LONGITUDE"]
+    swapped = (lat.abs() > 90) & (lon.abs() <= 90)
+    if swapped.any() and swapped.sum() >= 0.5 * (lat.notna() & lon.notna()).sum():
+        issue("coordinates_swapped", "warning", swapped, "LATITUDE and LONGITUDE look swapped; swapped back",
+              out.loc[swapped, "ADDR_ID"])
+        out.loc[swapped, ["LATITUDE", "LONGITUDE"]] = out.loc[swapped, ["LONGITUDE", "LATITUDE"]].values
+        lat, lon = out["LATITUDE"], out["LONGITUDE"]
+    bad = (lat.abs() > 90) | (lon.abs() > 180)
+    issue("coordinate_out_of_range", "warning", bad, "geocode outside -90..90 / -180..180; treated as missing",
+          out.loc[bad, "ADDR_ID"])
+    out.loc[bad, ["LATITUDE", "LONGITUDE"]] = float("nan")
 
 
 def analyse(clean: pd.DataFrame, cfg: Config, parcels: Optional[Iterable[str]] = None,

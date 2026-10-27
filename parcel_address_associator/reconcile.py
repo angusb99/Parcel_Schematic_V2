@@ -8,7 +8,7 @@ from typing import Dict, List, Optional, Set, Tuple
 
 from .alignment import BlockLink, Structure, build_structures, link_blocks, sigmoid
 from .config import Config
-from .features import Feat, base_relation, build_feat, compare_brefs
+from .features import Feat, base_relation, build_feat, compare_brefs, is_common_name
 from .model import Address
 from .schemes import Block, Style, build_styles
 
@@ -176,6 +176,8 @@ def parent_pairs(parents: List[ParentInfo], cfg: Config) -> List[PairResult]:
             fa, fb = pa.feat, pb.feat
             if compare_brefs(fa.bref, fb.bref) == "conflict":
                 continue
+            if is_common_name(fa.bname) != is_common_name(fb.bname):
+                continue                     # 'COMMON PROPERTY, 10 X ST' is not the building itself
             rel = base_relation(fa, fb)
             sa, sb = set(pa.structures), set(pb.structures)
             overlap = len(sa & sb) / len(sa | sb) if (sa | sb) else 0.0

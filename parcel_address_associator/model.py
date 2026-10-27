@@ -20,6 +20,8 @@ INPUT_COLUMNS: List[str] = [
 REQUIRED_COLUMNS = ["ADDR_ID", "CADASTRE_POLYGON_PID"]
 # Optional: used only by the residential-use reconciliation, never by matching.
 OPTIONAL_COLUMNS: List[str] = ["ADDRESS_TYPE"]
+# Optional geocode (decimal degrees): used only by shell detection.
+GEO_COLUMNS: List[str] = ["LATITUDE", "LONGITUDE"]
 
 # input column -> Address attribute
 COLUMN_TO_FIELD: Dict[str, str] = {

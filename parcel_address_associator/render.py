@@ -6,6 +6,8 @@ renders in Jupyter, JupyterLab, VS Code and Databricks ``displayHTML``.
 from __future__ import annotations
 
 import html
+import math
+from collections import Counter, defaultdict
 from typing import Dict, Iterable, List, Optional
 
 from . import codes
@@ -194,8 +196,125 @@ def use_section_html(r: ParcelResult, use_rows: Dict[str, dict], blocks_df, max_
     return "".join(h)
 
 
+SHELL_FILL = {"SHELL": "var(--s8)", "POSSIBLE_SHELL": "#fab219"}
+_SHELL_RANK = {"SHELL": 0, "POSSIBLE_SHELL": 1}
+
+
+def _rings(g):
+    for poly in (g.geoms if g.geom_type == "MultiPolygon" else [g]):
+        yield list(poly.exterior.coords)
+        for ring in poly.interiors:
+            yield list(ring.coords)
+
+
+def shell_plan_svg(site, shell_rows: Dict[str, dict], size: int = 380) -> str:
+    """Parcel outline (dashed), building footprints and geocodes: red = shell,
+    amber = possible shell, blue = unit/dwelling, grey = anything else."""
+    pg = site.geo if site is not None else None
+    if pg is None or not site.point:
+        return '<p class="muted">No geometry or geocodes for this parcel.</p>'
+    shapes = ([pg.polygon] if pg.polygon is not None else []) + list(pg.buildings.values())
+    xs = [v for g in shapes for v in (g.bounds[0], g.bounds[2])] + [p[0] for p in site.point.values()]
+    ys = [v for g in shapes for v in (g.bounds[1], g.bounds[3])] + [p[1] for p in site.point.values()]
+    minx, maxx, miny, maxy = min(xs), max(xs), min(ys), max(ys)
+    pad = 10
+    k = (size - 2 * pad) / max(maxx - minx, maxy - miny, 1.0)
+    w, h = int(round((maxx - minx) * k + 2 * pad)), int(round((maxy - miny) * k + 2 * pad))
+    X = lambda x: pad + (x - minx) * k
+    Y = lambda y: h - pad - (y - miny) * k
+
+    def path(g) -> str:
+        return " ".join("M" + " L".join("%.1f,%.1f" % (X(x), Y(y)) for x, y in ring) + " Z" for ring in _rings(g))
+    out = ['<svg role="img" aria-label="parcel plan %s" width="%d" height="%d" viewBox="0 0 %d %d">'
+           % (_e(site.parcel), w, h, w, h)]
+    if pg.polygon is not None:
+        out.append('<path d="%s" fill="none" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="5 3">'
+                   '<title>parcel %s · %.0f m²</title></path>' % (path(pg.polygon), _e(site.parcel), pg.area))
+    n_in = Counter(fp for pid, fp in site.footprint.items() if fp and site.building_level(pid))
+    for bid, g in pg.buildings.items():
+        out.append('<path d="%s" fill="var(--empty)" stroke="var(--ink2)" stroke-width="0.8">'
+                   '<title>footprint %s · %.0f m² · %d building-level geocodes</title></path>'
+                   % (path(g), _e(bid), g.area, n_in[bid]))
+    at: Dict[tuple, List[str]] = defaultdict(list)
+    for pid, (x, y) in site.point.items():
+        at[(round(x, 1), round(y, 1))].append(pid)
+
+    def rank(pids):
+        rows = [shell_rows[p] for p in pids if p in shell_rows]
+        best = min((_SHELL_RANK.get(x["VERDICT"], 9) for x in rows), default=9)
+        return best, rows
+    for (x, y), pids in sorted(at.items(), key=lambda kv: -rank(kv[1])[0]):     # shells drawn on top
+        best, rows = rank(pids)
+        verdict = next((v for v, rk in _SHELL_RANK.items() if rk == best), "")
+        rest = [x_ for x_ in rows if x_["VERDICT"] == "NOT_SHELL"]
+        # fill: what is mostly at the point; a ring marks shells sharing it with others
+        if not rest:
+            fill, ring = SHELL_FILL.get(verdict, "var(--muted)"), "var(--surface)"
+        else:
+            units = sum(1 for x_ in rest if x_["KIND"] == "UNIT")
+            fill = "var(--s1)" if units * 2 >= len(rest) else "var(--muted)"
+            ring = SHELL_FILL.get(verdict, "var(--surface)")
+        prop = all(pid in site.property_level for pid in pids)
+        tip = "%d address%s at this %sgeocode\n%s" % (
+            len(pids), "es" if len(pids) > 1 else "", "property-level (parcel centroid) " if prop else "",
+            "\n".join("%s%s  %s (P=%.2f)" % (x_["VERDICT"], " " + x_["SHELL_CLASS"] if x_["SHELL_CLASS"] else "",
+                                            x_["LABEL"], x_["P_SHELL"])
+                      for x_ in sorted(rows, key=lambda x_: -x_["P_SHELL"])[:25]))
+        r = 3 + min(math.log2(len(pids)), 4)
+        if prop:        # hollow: says nothing about which building
+            out.append('<g><circle cx="%.1f" cy="%.1f" r="%.1f" fill="var(--surface)" stroke="%s" stroke-width="2.5"/>'
+                       '<title>%s</title></g>' % (X(x), Y(y), r, ring if ring != "var(--surface)" else fill, _e(tip)))
+            continue
+        out.append('<g><circle cx="%.1f" cy="%.1f" r="%.1f" fill="%s" stroke="%s" stroke-width="%s"/>'
+                   '<title>%s</title></g>' % (X(x), Y(y), r, fill, ring,
+                                              "1" if ring == "var(--surface)" else "2.5", _e(tip)))
+    out.append("</svg>")
+    return "".join(out)
+
+
+def shell_section_html(r: ParcelResult, shell_rows: Dict[str, dict], site, max_rows: int = 200) -> str:
+    rows = [shell_rows[f.pid] for f in r.feats if f.pid in shell_rows]
+    if not rows:
+        return ""
+    count = lambda pred: sum(1 for x in rows if pred(x))
+    h = ["<h4>8. Shell addresses</h4><div class='tiles'>"]
+    for v, t in ((count(lambda x: x["VERDICT"] == "SHELL"), "shells"),
+                 (count(lambda x: x["VERDICT"] == "POSSIBLE_SHELL"), "possible shells"),
+                 (count(lambda x: x["CATEGORY"] == "SHELL_FLAGGED_RESIDENTIAL"), "shells counted residential"),
+                 (count(lambda x: x["CATEGORY"] == "SHELL_NOT_TYPED"), "shells not typed as shells"),
+                 (count(lambda x: x["CATEGORY"] == "TYPED_SHELL_NOT_DETECTED"), "typed shells not detected")):
+        h.append("<div class='tile'><b>%s</b><span>%s</span></div>" % (format(v, ","), _e(t)))
+    h.append("</div>")
+    if site is not None and site.geo is not None:
+        h.append("<div class='sub'><span class='sw' style='background:var(--s8)'></span>shell "
+                 "<span class='sw' style='background:#fab219'></span>possible shell "
+                 "<span class='sw' style='background:var(--s1)'></span>unit "
+                 "<span class='sw' style='background:var(--muted)'></span>other · a red/amber ring = a shell "
+                 "sharing the geocode · hollow = property-level geocode (parcel centroid: says nothing about the "
+                 "building) · dashed = parcel · grey = footprints · bigger dot = more addresses at one geocode · "
+                 "hover for details</div>")
+        h.append("<div class='plans'><div>%s</div></div>" % shell_plan_svg(site, shell_rows))
+    shown = [x for x in rows if x["VERDICT"] != "NOT_SHELL" or x["CATEGORY"] != "OK"]
+    if shown:
+        h.append("<table><tr><th>Address</th><th>Verdict</th><th>Class</th><th>P</th><th>Below it</th>"
+                 "<th>Category</th><th>Evidence (log-odds)</th></tr>")
+        for x in sorted(shown, key=lambda x: (-x["P_SHELL"], x["LABEL"]))[:max_rows]:
+            below = ""
+            if x["N_CHILD_PREMISES"] is not None and x["N_CHILD_PREMISES"] == x["N_CHILD_PREMISES"]:
+                below = "%d here" % x["N_CHILD_PREMISES"]
+                if x["N_CROSS_PARCEL_PREMISES"]:
+                    below += ", %d next door" % x["N_CROSS_PARCEL_PREMISES"]
+            h.append("<tr><td>%s <span class='muted mono'>%s</span></td><td>%s</td><td>%s</td><td class='n'>%.2f</td>"
+                     "<td>%s</td><td>%s</td><td class='ev'>%s</td></tr>"
+                     % (_e(x["LABEL"]), _e(x["ADDR_ID"]), _e(x["VERDICT"]), _e(x["SHELL_CLASS"]), x["P_SHELL"],
+                        _e(below), _e(x["CATEGORY"]), _e(x["EVIDENCE"])))
+        h.append("</table>")
+    return "".join(h)
+
+
 def parcel_html(r: ParcelResult, cfg: Config, max_rows: int = 200, include_css: bool = True,
-                use_rows: Optional[Dict[str, dict]] = None, use_blocks=None) -> str:
+                use_rows: Optional[Dict[str, dict]] = None, use_blocks=None,
+                shell_rows: Optional[Dict[str, dict]] = None, site=None) -> str:
     slots = style_slots(r)
     n_rev = len(r.review_pairs)
     h = [CSS if include_css else "",
@@ -270,6 +389,8 @@ def parcel_html(r: ParcelResult, cfg: Config, max_rows: int = 200, include_css: 
         h.append("</table>")
     if use_rows:
         h.append(use_section_html(r, use_rows, use_blocks, max_rows))
+    if shell_rows:
+        h.append(shell_section_html(r, shell_rows, site, max_rows))
     h.append("</div>")
     return "".join(h)
 
@@ -338,7 +459,7 @@ body{margin:0;background:#fcfcfb}@media (prefers-color-scheme:dark){body{backgro
 
 def report_html(results: Iterable[ParcelResult], cfg: Config, stats: Dict[str, object],
                 detailed: List[str], title: str = "Parcel Address Associator", index_rows: int = 1000,
-                use: Optional[Dict[str, object]] = None) -> str:
+                use: Optional[Dict[str, object]] = None, shells: Optional[Dict[str, object]] = None) -> str:
     """Standalone HTML document: overview, parcel index, and a full section for each
     parcel in ``detailed``. Self-contained (inline CSS and SVG, no scripts)."""
     import datetime
@@ -353,15 +474,19 @@ def report_html(results: Iterable[ParcelResult], cfg: Config, stats: Dict[str, o
     h.append("<h1>%s</h1><div class='sub'>Generated %s · %d parcels analysed · %d shown in detail below</div>"
              % (_e(title), datetime.datetime.now().strftime("%Y-%m-%d %H:%M"), len(res), len(detailed)))
     h.append(overview_html(res, stats).replace(CSS, ""))
+    shell_rows = (shells or {}).get("rows") or {}
+    n_shells = Counter(x["CADASTRE_POLYGON_PID"] for x in shell_rows.values() if x["VERDICT"] == "SHELL")
     h.append("<h4>Parcels (%s)</h4><table><tr><th>Parcel</th><th>Addresses</th><th>Styles</th><th>Structures</th>"
-             "<th>Duplicate groups</th><th>Redundant addresses</th><th>Review pairs</th></tr>"
-             % ("first %d of %d" % (index_rows, len(res)) if len(res) > index_rows else len(res)))
+             "<th>Duplicate groups</th><th>Redundant addresses</th><th>Review pairs</th>%s</tr>"
+             % ("first %d of %d" % (index_rows, len(res)) if len(res) > index_rows else len(res),
+                "<th>Shells</th>" if shell_rows else ""))
     for r in res[:index_rows]:
         name = ("<a href='#p-%s'>%s</a>" % (_e(r.parcel), _e(r.parcel))) if r.parcel in shown else _e(r.parcel)
         h.append("<tr><td class='mono'>%s</td><td class='n'>%d</td><td class='n'>%d</td><td class='n'>%d</td>"
-                 "<td class='n'>%d</td><td class='n'>%d</td><td class='n'>%d</td></tr>"
+                 "<td class='n'>%d</td><td class='n'>%d</td><td class='n'>%d</td>%s</tr>"
                  % (name, len(r.feats), len(r.styles), len(r.structures), len(r.groups),
-                    sum(len(g.members) - 1 for g in r.groups), len(r.review_pairs)))
+                    sum(len(g.members) - 1 for g in r.groups), len(r.review_pairs),
+                    "<td class='n'>%d</td>" % n_shells[r.parcel] if shell_rows else ""))
     h.append("</table>")
     use_rows, use_blocks = {}, None
     if use:
@@ -370,6 +495,7 @@ def report_html(results: Iterable[ParcelResult], cfg: Config, stats: Dict[str, o
     for pid in detailed:
         ub = use_blocks[use_blocks.CADASTRE_POLYGON_PID == pid] if use_blocks is not None and len(use_blocks) else None
         h.append("<section id='p-%s'>%s</section>" % (_e(pid), parcel_html(
-            by_id[pid], cfg, include_css=False, use_rows=use_rows or None, use_blocks=ub)))
+            by_id[pid], cfg, include_css=False, use_rows=use_rows or None, use_blocks=ub,
+            shell_rows=shell_rows or None, site=(shells or {}).get("sites", {}).get(pid))))
     h.append("</div></body></html>")
     return "".join(h)

@@ -13,6 +13,16 @@ _BREF_AFTER = re.compile(r"^(?:THE\s+)?%s\s+([A-Z]{1,2}|\d{1,3})$" % _BWORD)
 _BREF_BEFORE = re.compile(r"^(?:THE\s+)?([A-Z]{1,2}|\d{1,3})\s+%s$" % _BWORD)
 _BREF_NAMED = re.compile(r"^(?:THE\s+)?([A-Z][A-Z ]*?)\s+%s$" % _BWORD)
 _INT = re.compile(r"^\d+$")
+# building names that denote common property or a shared facility, not a building
+COMMON_WORDS = re.compile(
+    r"\b(COMMON (PROPERTY|AREAS?)|ASSOCIATION PROPERTY|CAR ?PARK|PARKING|PLANT ROOM|SUBSTATION|"
+    r"SWIMMING POOL|POOL HOUSE|GYM(NASIUM)?|RECREATION|COMMUNITY (CENTRE|HALL|ROOM)|CLUB ?HOUSE|"
+    r"BUILDING MANAGEMENT|STRATA|OWNERS CORP\w*|BODY CORP\w*|CONCIERGE|RECEPTION|LOBBY|BASEMENT|"
+    r"MAIL ?ROOM|BIN (ROOM|STORE)|PUMP (ROOM|STATION))\b")
+
+
+def is_common_name(name: str) -> bool:
+    return bool(name) and COMMON_WORDS.search(name) is not None
 
 
 def to_int(v: str) -> Optional[int]:

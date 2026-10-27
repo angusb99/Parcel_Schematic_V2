@@ -1,3 +1,7 @@
 pandas>=1.5
+# optional, for shell detection with parcel / footprint geometry:
+shapely>=2.0
+# optional, only for projected (metre) WKT:
+# pyproj
 # optional, for the notebook:
 # jupyter

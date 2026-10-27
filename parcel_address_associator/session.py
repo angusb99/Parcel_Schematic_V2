@@ -9,6 +9,8 @@
     s.save_html("report.html")       # 5. HTML report: styles, mappings, stacking plans per parcel
     s.duplicate_groups()             # 6. results as DataFrames
     s.explain(addr_id)               # 7. why one address was (or was not) grouped
+    s.attach_geometry(cadastre_df, buildings_df)   # optional: parcels and footprints (WKT)
+    s.detect_shells()                # 8. shell addresses: whole building, site, common property
 """
 from __future__ import annotations
 
@@ -47,11 +49,16 @@ class AssociatorSession:
         self.clean: Optional[pd.DataFrame] = None
         self.issues: Optional[pd.DataFrame] = None
         self.results: Dict[str, ParcelResult] = {}
+        self._ran = False                     # results may be empty: every parcel too small
         self._log: List[Dict[str, object]] = []
         self._cache: Dict[str, pd.DataFrame] = {}
         self.use_flags: Optional[Dict[str, Optional[bool]]] = None   # second dataset, by ADDR_ID
         self.use_issues: Optional[pd.DataFrame] = None
         self.use: Dict[str, pd.DataFrame] = {}                       # reconciliation outputs
+        self.geo = None                                              # GeoData (attach_geometry)
+        self.geo_issues: Optional[pd.DataFrame] = None
+        self.shell: Dict[str, pd.DataFrame] = {}                     # shell detection outputs
+        self._sites = None
 
     def __repr__(self) -> str:
         if not self.results:
@@ -80,7 +87,7 @@ class AssociatorSession:
             self.validate()
 
     def _need_results(self):
-        if not self.results:
+        if not self._ran:
             raise RuntimeError("Run the engine first: session.run()")
 
     def _cached(self, name: str, builder) -> pd.DataFrame:
@@ -158,6 +165,7 @@ class AssociatorSession:
                 if n >= 200 and (i == n or i % (n // 10) == 0):
                     print("  %d/%d parcels (%.0fs)" % (i, n, time.time() - t0))
         new = analyse(self.clean, self.config, parcels=parcels, progress=cb)
+        self._ran = True
         if parcels is None:
             self.results = new
         else:
@@ -166,6 +174,9 @@ class AssociatorSession:
         if self.use:
             self.use = {}
             self._say("  (use reconciliation cleared: run reconcile_use() again)")
+        if self.shell:
+            self.shell, self._sites = {}, None
+            self._say("  (shell detection cleared: run detect_shells() again)")
         groups = sum(len(r.groups) for r in new.values())
         self._record("run" if parcels is None else "rerun", t0, PARCELS=len(new), GROUPS=groups,
                      REVIEW_PAIRS=sum(len(r.review_pairs) for r in new.values()))
@@ -215,7 +226,7 @@ class AssociatorSession:
                 raise KeyError("Not analysed: %s" % ", ".join(missing[:5]))
         stats = {"rows_in": len(self.raw), "rows_accepted": len(self.clean)}
         html_doc = report_html(self.results.values(), self.config, stats, detailed, title=title,
-                               use=self.use or None)
+                               use=self.use or None, shells=self._shell_view())
         path = os.path.abspath(path)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as fh:
@@ -246,8 +257,16 @@ class AssociatorSession:
             use_rows = {row["ADDR_ID"]: row for row in t[t.CADASTRE_POLYGON_PID == parcel].to_dict("records")}
             ub = self.use["blocks"]
             use_blocks = ub[ub.CADASTRE_POLYGON_PID == parcel] if len(ub) else None
+        shells = self._shell_view()
         return _display_html(parcel_html(self._results(parcel)[0], self.config, use_rows=use_rows,
-                                         use_blocks=use_blocks))
+                                         use_blocks=use_blocks, shell_rows=shells["rows"] if shells else None,
+                                         site=shells["sites"].get(parcel) if shells else None))
+
+    def _shell_view(self):
+        if not self.shell:
+            return None
+        return {"rows": {r["ADDR_ID"]: r for r in self.shell["addresses"].to_dict("records")},
+                "sites": self._sites or {}}
 
     # ---------------------------------------------------------- 6. tables
     def parcel_summary(self) -> pd.DataFrame:
@@ -299,6 +318,10 @@ class AssociatorSession:
             frames.update({"use_issues": self.use_issues, "use_reconciliation": self.use["addresses"],
                            "use_areas": self.use["blocks"], "use_by_parcel": self.use["parcels"],
                            "source_reliability": self.use["reliability"]})
+        if self.shell:
+            frames.update({"geometry_issues": self.geo_issues, "shells": self.shell["addresses"],
+                           "shell_buildings": self.shell["buildings"], "shells_by_parcel": self.shell["parcels"],
+                           "shell_geocode_issues": self.shell["issues"]})
         return frames
 
     # --------------------------------------------- 8. residential use
@@ -312,6 +335,9 @@ class AssociatorSession:
         self.use_flags, self.use_issues = prepare_use(use_df, id_col, flag_col,
                                                       known_ids=set(self.clean["ADDR_ID"]))
         self.use = {}
+        if self.shell:
+            self.shell, self._sites = {}, None
+            self._say("  (shell detection cleared: run detect_shells() again to use these flags)")
         self._record("attach_use", t0, rows=len(use_df), flags=len(self.use_flags),
                      residential=sum(1 for v in self.use_flags.values() if v))
         self._say("attach_use: %d flags (%d residential), %d issue types"
@@ -321,7 +347,8 @@ class AssociatorSession:
     def reconcile_use(self) -> "AssociatorSession":
         """Reconcile the base ADDRESS_TYPE with the attached dataset, per premise,
         using the parcel structure. Covers every accepted ADDR_ID (parcels too small
-        to analyse are reconciled from flat type and flags alone)."""
+        to analyse are reconciled from flat type and flags alone). If detect_shells()
+        has run, its verdicts decide which parents are buildings and which are houses."""
         from .model import Address
         from .usage import (block_use_table, build_premises, decide, find_area_patterns, fit,
                             parcel_use_summary, review_partners)
@@ -336,8 +363,10 @@ class AssociatorSession:
         analysed = {f.pid for r in self.results.values() for f in r.feats}
         extra = [Address.from_row(r) for r in
                  self.clean[~self.clean["ADDR_ID"].isin(analysed)].to_dict("records")]
+        shell = dict(zip(self.shell["addresses"]["ADDR_ID"], self.shell["addresses"]["VERDICT"])) \
+            if self.shell else None
         premises, blocks = build_premises(self.results.values(), extra, base, self.use_flags,
-                                          review_partners(self.results.values()))
+                                          review_partners(self.results.values()), shell)
         find_area_patterns(premises, blocks, cfg)
         reliability = fit(premises, cfg)
         table = decide(premises, base_type, base, self.use_flags, cfg)
@@ -401,6 +430,103 @@ class AssociatorSession:
         out.insert(1, "MEANING", out["CATEGORY"].map(CATEGORY_NOTES))
         return out
 
+    # ------------------------------------------------- 9. shell addresses
+    def attach_geometry(self, cadastre: Optional[pd.DataFrame] = None, buildings: Optional[pd.DataFrame] = None,
+                        crs: Optional[str] = None, wkt_col: Optional[str] = None,
+                        building_wkt_col: Optional[str] = None,
+                        building_id_col: Optional[str] = None) -> pd.DataFrame:
+        """Attach cadastre parcels [CADASTRE_POLYGON_PID, WKT] and building footprints
+        [BUILDING_ID (optional), CADASTRE_POLYGON_PID, WKT] for shell detection. Either
+        may be None. Returns the geometry issues table."""
+        from .geometry import prepare_geometry
+        t0 = time.time()
+        self.geo = prepare_geometry(cadastre, buildings, crs=crs, wkt_col=wkt_col,
+                                    building_wkt_col=building_wkt_col, building_id_col=building_id_col)
+        self.geo_issues = self.geo.issues
+        self.shell, self._sites = {}, None
+        n_fp = sum(len(p.buildings) for p in self.geo.parcels.values())
+        n_poly = sum(1 for p in self.geo.parcels.values() if p.polygon is not None)
+        self._record("attach_geometry", t0, parcels=n_poly, footprints=n_fp, issues=len(self.geo_issues))
+        self._say("attach_geometry: %d parcel polygons, %d footprints (%s)" % (
+            n_poly, n_fp, "lon/lat" if self.geo.geographic else "projected"))
+        return self.geo_issues
+
+    def detect_shells(self) -> "AssociatorSession":
+        """Score every accepted ADDR_ID as a shell (whole building, site, common property,
+        whole floor) or not. Uses the parcel structure from run(), the geometry if
+        attached, ADDRESS_TYPE, and the second use dataset if attached."""
+        from .model import Address
+        from .shells import build_sites, building_table, decide, detect, geocode_issues, parcel_table
+        self._need_results()
+        t0 = time.time()
+        cfg = self.config
+        c = self.clean
+        analysed = {f.pid for r in self.results.values() for f in r.feats}
+        extra = [Address.from_row(r) for r in c[~c["ADDR_ID"].isin(analysed)].to_dict("records")]
+        coords = {a: (lon, lat) for a, lat, lon in zip(c["ADDR_ID"], c["LATITUDE"], c["LONGITUDE"])
+                  if lat == lat and lon == lon}
+        sites = build_sites(self.results.values(), extra, self.geo, coords, cfg)
+        verdicts = detect(sites, self.geo, cfg)
+        table = decide(sites, verdicts, dict(zip(c["ADDR_ID"], c["ADDRESS_TYPE"])), self.use_flags, cfg)
+        self.shell = {"addresses": table, "buildings": building_table(sites, table),
+                      "parcels": parcel_table(sites, table), "issues": geocode_issues(sites, coords, self.geo)}
+        self._sites = sites
+        vc = table["VERDICT"].value_counts()
+        by_cls = table.loc[table.VERDICT == "SHELL", "SHELL_CLASS"].value_counts().to_dict()
+        n_res = int((table.CATEGORY == "SHELL_FLAGGED_RESIDENTIAL").sum())
+        self._record("detect_shells", t0, addresses=len(table), shells=int(vc.get("SHELL", 0)),
+                     possible=int(vc.get("POSSIBLE_SHELL", 0)), flagged_residential=n_res,
+                     geocoded=int(table.GEOCODED.sum()))
+        self._say("detect_shells: %d addresses, %d shells (%s), %d possible; %d shells counted as residential; "
+                  "%d addresses placed on geometry" % (
+                      len(table), int(vc.get("SHELL", 0)),
+                      ", ".join("%s %d" % (k.lower(), v) for k, v in sorted(by_cls.items())) or "none",
+                      int(vc.get("POSSIBLE_SHELL", 0)), n_res, int(table.GEOCODED.sum())))
+        if self.use:
+            self._say("  (run reconcile_use() again so the use reconciliation uses these verdicts)")
+        return self
+
+    def _need_shells(self):
+        if not self.shell:
+            raise RuntimeError("Run session.detect_shells() first")
+
+    def shells(self, parcel: Optional[str] = None, verdict: Optional[str] = None,
+               shell_class: Optional[str] = None, category: Optional[str] = None,
+               include_not_shell: bool = False) -> pd.DataFrame:
+        """Per ADDR_ID: P_SHELL, VERDICT, SHELL_CLASS, what hangs below it, ADDRESS_TYPE and
+        flags, CATEGORY and evidence. By default only SHELL and POSSIBLE_SHELL rows, plus
+        rows whose ADDRESS_TYPE disagrees."""
+        self._need_shells()
+        df = self._filter(self.shell["addresses"], parcel)
+        if verdict:
+            df = df[df["VERDICT"] == verdict.upper()]
+        elif not include_not_shell:
+            df = df[(df["VERDICT"] != "NOT_SHELL") | (df["CATEGORY"] != "OK")]
+        if shell_class:
+            df = df[df["SHELL_CLASS"] == shell_class.upper()]
+        if category:
+            df = df[df["CATEGORY"] == category.upper()]
+        return df.sort_values(["CADASTRE_POLYGON_PID", "P_SHELL"], ascending=[True, False]).reset_index(drop=True)
+
+    def shell_buildings(self, parcel: Optional[str] = None) -> pd.DataFrame:
+        """Per footprint: geocodes inside, sub-address premises, parents and shells."""
+        self._need_shells()
+        return self._filter(self.shell["buildings"], parcel)
+
+    def shell_summary(self) -> pd.DataFrame:
+        """Per parcel: shells by class, possible shells, shells counted as residential."""
+        self._need_shells()
+        return self.shell["parcels"]
+
+    def shell_category_summary(self) -> pd.DataFrame:
+        """Categories x verdict, with what each category means."""
+        from .shells import CATEGORY_NOTES
+        self._need_shells()
+        t = self.shell["addresses"]
+        out = pd.crosstab(t["CATEGORY"], t["VERDICT"]).reset_index()
+        out.insert(1, "MEANING", out["CATEGORY"].map(CATEGORY_NOTES))
+        return out
+
     # -------------------------------------------------------- 7. explain
     def explain(self, addr_id: str) -> Dict[str, object]:
         """Trace one address through every stage."""
@@ -445,6 +571,14 @@ class AssociatorSession:
                         x.RECONCILED_USE, x.P_DWELLING, x.BASE_RESIDENTIAL, x.OTHER_RESIDENTIAL, x.CATEGORY,
                         x.SUGGESTED_ACTION)).strip()
                     out["USE_EVIDENCE"] = x.EVIDENCE
+            if self.shell:
+                u = self.shell["addresses"]
+                u = u[u.ADDR_ID == addr_id]
+                if len(u):
+                    x = u.iloc[0]
+                    out["SHELL"] = " ".join(str(v) for v in (x.VERDICT, x.SHELL_CLASS, "(P=%.2f)" % x.P_SHELL,
+                                                             x.CATEGORY, x.SUGGESTED_ACTION) if v)
+                    out["SHELL_EVIDENCE"] = x.EVIDENCE
             if self.verbose:
                 for k, v in out.items():
                     if not isinstance(v, pd.DataFrame):
@@ -458,6 +592,17 @@ class AssociatorSession:
         return parcel_text(self._results(parcel)[0], self.config)
 
     # ------------------------------------------------------- evaluation
+    def evaluate_shells(self, truth: pd.DataFrame) -> Dict[str, object]:
+        """Score shell detection against truth [ADDR_ID, SHELL_CLASS, (SCENARIO)]."""
+        from .evaluate import evaluate_shells
+        self._need_shells()
+        ev = evaluate_shells(self.shell["addresses"], truth)
+        o = ev["overall"]
+        self._say("shells: precision %.4f  recall %.4f  (TP %d, FP %d, FN %d); class accuracy %s; "
+                  "possible: %d true / %d not" % (o["PRECISION"], o["RECALL"], o["TP"], o["FP"], o["FN"],
+                                                  o["CLASS_ACCURACY"], o["POSSIBLE_TRUE"], o["POSSIBLE_FALSE"]))
+        return ev
+
     def evaluate_use(self, truth: pd.DataFrame) -> Dict[str, object]:
         """Score the use reconciliation against truth [ADDR_ID, ENTITY_ID, IS_DWELLING, ...]."""
         from .evaluate import evaluate_use
